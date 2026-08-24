@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Dataset
+data/
+*.csv
+*.parquet
+
+# Trained models
+models/
+*.h5
+*.keras
+*.pt
+*.pth
+*.onnx
+
+# Logs
+logs/
+*.log
+
+# Environment/secrets
+.env

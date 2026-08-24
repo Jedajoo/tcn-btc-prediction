@@ -1,0 +1,8 @@
+IPython
+panda
+numpy
+yfinance
+matplotlib
+scikit-learn
+tensorflow[and-cuda]
+keras-tcn
