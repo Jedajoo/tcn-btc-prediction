@@ -130,7 +130,7 @@ def objective_function(params, folds, X_train, y_train):
             batch_size=128,
             shuffle=False,
             callbacks=[early_stop],
-            verbose=0
+            verbose=1
         )
 
         # =========================
