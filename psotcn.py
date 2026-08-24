@@ -29,6 +29,8 @@ from joblib import load, dump
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from tensorflow.keras.callbacks import EarlyStopping
+import keras
+import gc
 import utils as ut
 import random
 
@@ -140,6 +142,10 @@ def objective_function(params, folds, X_train, y_train):
         )
 
         fold_losses.append(best_val_loss)
+
+        keras.backend.clear_session()
+        del model
+        gc.collect()
 
     # =========================
     # FITNESS
