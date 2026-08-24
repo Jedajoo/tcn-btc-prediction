@@ -82,6 +82,7 @@ def objective_function(params, folds, X_train, y_train):
     # =========================
 
     for fold_idx, (train_idx, val_idx) in enumerate(folds):
+        print(f"Folds: {fold_idx}")
 
         X_tr = X_train[train_idx]
         y_tr = y_train[train_idx]
@@ -101,6 +102,8 @@ def objective_function(params, folds, X_train, y_train):
         # =========================
 
         tf.keras.backend.clear_session()
+
+        print(f"  filters={n_filters}, kernel={k_size}, dropout={dropout:.4f}, lr={learning_rate:.6f}")
 
         model = ut.build_tcn_model(
             input_shape,
