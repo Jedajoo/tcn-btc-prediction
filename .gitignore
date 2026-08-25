@@ -23,6 +23,9 @@ models/
 *.pth
 *.onnx
 
+# Checkpoints
+checkpoints/
+
 # Logs
 logs/
 *.log

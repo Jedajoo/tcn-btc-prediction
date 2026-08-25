@@ -1,6 +1,8 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
+import os
+import pickle
 
 gpus = tf.config.list_physical_devices('GPU')
 
@@ -59,10 +61,6 @@ def objective_function(params, folds, X_train, y_train):
 
     n_filters, dropout, log_lr = params
 
-    # =========================
-    # DECODE PARAMETER
-    # =========================
-
     n_filters = int(
         16 * round(n_filters / 16)
     )
@@ -77,10 +75,6 @@ def objective_function(params, folds, X_train, y_train):
 
     fold_losses = []
 
-    # =========================
-    # WALK-FORWARD FOLDS
-    # =========================
-
     for fold_idx, (train_idx, val_idx) in enumerate(folds):
         print(f"Folds: {fold_idx}")
 
@@ -90,16 +84,8 @@ def objective_function(params, folds, X_train, y_train):
         X_val = X_train[val_idx]
         y_val = y_train[val_idx]
 
-        # =========================
-        # RESET RANDOMNESS
-        # =========================
-
         seed = 42 + fold_idx
         set_seed(seed)
-
-        # =========================
-        # RESET MODEL
-        # =========================
 
         tf.keras.backend.clear_session()
 
@@ -116,29 +102,21 @@ def objective_function(params, folds, X_train, y_train):
 
         early_stop = EarlyStopping(
             monitor='val_loss',
-            patience=10,
+            patience=20,
             restore_best_weights=True,
             verbose=0
         )
-
-        # =========================
-        # TRAIN
-        # =========================
 
         history = model.fit(
             X_tr,
             y_tr,
             validation_data=(X_val, y_val),
             epochs=100,
-            batch_size=128,
+            batch_size=16,
             shuffle=False,
             callbacks=[early_stop],
             verbose=1
         )
-
-        # =========================
-        # BEST FOLD LOSS
-        # =========================
 
         best_val_loss = min(
             history.history['val_loss']
@@ -149,10 +127,6 @@ def objective_function(params, folds, X_train, y_train):
         keras.backend.clear_session()
         del model
         gc.collect()
-
-    # =========================
-    # FITNESS
-    # =========================
 
     mean_loss = np.mean(fold_losses)
     std_loss = np.std(fold_losses)
@@ -175,79 +149,161 @@ def objective_function(params, folds, X_train, y_train):
 
     return fitness
 
+CHECKPOINT_DIR = "checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# =========================
-# PARAMETER PSO
-# =========================
-n_particles = 30
-n_iterations = 50
+PSO_CHECKPOINT = os.path.join(
+    CHECKPOINT_DIR,
+    "pso_state.pkl"
+)
+
+def save_pso_checkpoint(iter_count, particle_idx, particles, gbest_position, gbest_value):
+    state = {
+        "iter_count": iter_count,
+        "particle_idx": particle_idx,
+
+        "particles": particles,
+
+        "gbest_position": gbest_position,
+        "gbest_value": gbest_value,
+
+        # Random state
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+    }
+
+    temp_file = PSO_CHECKPOINT + ".tmp"
+
+    with open(temp_file, "wb") as f:
+        pickle.dump(state, f)
+
+    # Atomic replace
+    os.replace(temp_file, PSO_CHECKPOINT)
+
+    print(
+        f"Checkpoint tersimpan "
+        f"(iterasi={iter_count + 1}, particle={particle_idx + 1})"
+    )
+
+
+def load_pso_checkpoint():
+    if not os.path.exists(PSO_CHECKPOINT):
+        return None
+
+    with open(PSO_CHECKPOINT, "rb") as f:
+        state = pickle.load(f)
+
+    random.setstate(state["python_random_state"])
+    np.random.set_state(state["numpy_random_state"])
+
+    print(
+        f"Checkpoint ditemukan: "
+        f"iterasi={state['iter_count'] + 1}, "
+        f"particle={state['particle_idx'] + 1}"
+    )
+
+    return state
+
+n_particles = 10
+n_iterations = 20
 c1 = 1.8
 c2 = 2.2
 
-# 🔥 boundaries (log scale untuk LR)
 boundaries = [
     (32, 256),      # n_filters
     (0.01, 0.3),    # dropout
     (-4, -3)      # log10(lr)
 ]
 
-# velocity max (20% range)
 v_max = [(b[1] - b[0]) * 0.2 for b in boundaries]
 
 set_seed(42)
 
-particles = []
+checkpoint = load_pso_checkpoint()
 
-for _ in range(n_particles):
+if checkpoint is None:
+    particles = []
 
-    position = [
-        random.uniform(*boundaries[0]),
-        random.uniform(*boundaries[1]),
-        random.uniform(*boundaries[2])
-    ]
+    for _ in range(n_particles):
 
-    velocity = [0.0] * 4
+        position = [
+            random.uniform(*boundaries[0]),
+            random.uniform(*boundaries[1]),
+            random.uniform(*boundaries[2])
+        ]
 
-    particles.append({
-        'position': position,
-        'velocity': velocity,
-        'pbest_position': position.copy(),
-        'pbest_value': float('inf')
-    })
+        velocity = [0.0] * 3
 
-gbest_position = None
-gbest_value = float('inf')
+        particles.append({
+            'position': position,
+            'velocity': velocity,
+            'pbest_position': position.copy(),
+            'pbest_value': float('inf')
+        })
+
+    gbest_position = None
+    gbest_value = float('inf')
+
+    start_iter = 0
+    start_particle = 0
+
+else:
+
+    particles = checkpoint["particles"]
+
+    gbest_position = checkpoint["gbest_position"]
+    gbest_value = checkpoint["gbest_value"]
+
+    start_iter = checkpoint["iter_count"]
+    start_particle = checkpoint["particle_idx"] + 1
 
 print("Memulai PSO...")
 
-# =========================
-# LOOP PSO
-# =========================
-for iter_count in range(n_iterations):
+for iter_count in range(start_iter, n_iterations):
 
     # inertia decay
     w = 0.9 - (0.5 * iter_count / n_iterations)
 
     print(f"\nIterasi {iter_count+1}/{n_iterations} | w={w:.3f}")
 
-    # ===== Evaluasi =====
-    for i, particle in enumerate(particles):
-        print(f"Partikel {i+1}/{n_particles}")
+    if iter_count == start_iter:
+        particle_start = start_particle
+    else:
+        particle_start = 0
+
+    for i in range(particle_start, n_particles):
+
+        particle = particles[i]
+
+        print(f"Partikel {i + 1}/{n_particles}")
 
         current_position = particle['position']
-        current_value = objective_function(current_position, folds, X_train, y_train)
+
+        current_value = objective_function(
+            current_position,
+            folds,
+            X_train,
+            y_train
+        )
 
         # update pbest
         if current_value < particle['pbest_value']:
             particle['pbest_value'] = current_value
-            particle['pbest_position'] = current_position.copy()
+            particle['pbest_position'] = (current_position.copy())
 
         # update gbest
         if current_value < gbest_value:
             gbest_value = current_value
-            gbest_position = current_position.copy()
+            gbest_position = (current_position.copy())
 
-    # ===== Update velocity & position =====
+        save_pso_checkpoint(
+            iter_count,
+            i,
+            particles,
+            gbest_position,
+            gbest_value
+        )
+
     for particle in particles:
         for j in range(len(particle['position'])):
 
@@ -260,7 +316,7 @@ for iter_count in range(n_iterations):
 
             v = (w * particle['velocity'][j]) + cognitive + social
 
-            # 🔥 velocity clamping
+            # velocity clamping
             v = max(-v_max[j], min(v_max[j], v))
             particle['velocity'][j] = v
 
@@ -272,29 +328,28 @@ for iter_count in range(n_iterations):
                 new_pos = int(16 * round(new_pos / 16))
                 new_pos = max(boundaries[0][0], min(boundaries[0][1], new_pos))
 
-            elif j == 1:
-                KERNEL_OPTIONS = [2, 3, 5]
+            elif j == 1:  # dropout
+                new_pos = max(boundaries[1][0], min(boundaries[1][1], new_pos))
 
-                new_pos = min(
-                    KERNEL_OPTIONS,
-                    key=lambda k: abs(k - new_pos)
-                )
-
-            elif j == 2:  # dropout
+            elif j == 2:  # log_lr
                 new_pos = max(boundaries[2][0], min(boundaries[2][1], new_pos))
 
-            elif j == 3:  # log_lr
-                new_pos = max(boundaries[3][0], min(boundaries[3][1], new_pos))
-
             particle['position'][j] = new_pos
+
+    start_particle = 0
+
+    save_pso_checkpoint(
+        iter_count + 1,
+        -1,
+        particles,
+        gbest_position,
+        gbest_value
+    )
 
 
 print("\nPSO Selesai!")
 print(f"Best Loss: {gbest_value:.6f}")
 
-# =========================
-# FINAL MODEL
-# =========================
 best_n_filters = int(gbest_position[0])
 best_k_size = int(gbest_position[1])
 best_dropout = float(gbest_position[2])
@@ -309,12 +364,34 @@ seed_losses = []
 seed_models = []
 seed_histories = []
 
+SEED_CHECKPOINT_DIR = os.path.join(
+    CHECKPOINT_DIR,
+    "seeds"
+)
+
+os.makedirs(
+    SEED_CHECKPOINT_DIR,
+    exist_ok=True
+) 
+
 for seed in range(42, 47):
+    seed_model_path = os.path.join(SEED_CHECKPOINT_DIR,f"model_seed_{seed}.keras")
+    seed_loss_path = os.path.join(SEED_CHECKPOINT_DIR,f"loss_seed_{seed}.npy")
+
+    if (os.path.exists(seed_model_path) and os.path.exists(seed_loss_path)):
+
+        print(
+            f"Seed {seed} sudah selesai. "
+            f"Skip."
+        )
+
+        best_val_loss = float(np.load(seed_loss_path))
+        seed_losses.append(best_val_loss)
+
+        continue
 
     print(f"\nTraining seed {seed}")
-
     set_seed(seed)
-
     tf.keras.backend.clear_session()
 
     model = ut.build_tcn_model(
@@ -326,12 +403,12 @@ for seed in range(42, 47):
         n_future=1
     )
 
-    early_stopping = ut.get_early_stopping()
+    early_stopping = ut.get_early_stopping(patience=50)
 
     history = model.fit(
         X_train,
         y_train,
-        epochs=1000,
+        epochs=300,
         batch_size=16,
         validation_split=0.2,
         shuffle=False,
@@ -339,18 +416,22 @@ for seed in range(42, 47):
         verbose=1
     )
 
-    best_val_loss = min(
-        history.history['val_loss']
-    )
+    best_val_loss = min(history.history['val_loss'])
+
+    model.save(seed_model_path)
+    np.save(seed_loss_path, best_val_loss)
 
     seed_losses.append(best_val_loss)
     seed_models.append(model)
     seed_histories.append(history)
 
-    print(
-        f"Seed {seed} → "
-        f"best val loss = {best_val_loss:.6f}"
-    )
+    print(f"Seed {seed} → " f"best val loss = {best_val_loss:.6f}")
+
+    del model
+    del history
+
+    tf.keras.backend.clear_session()
+    gc.collect()
 
 mean_loss = np.mean(seed_losses)
 std_loss = np.std(seed_losses)
@@ -374,9 +455,6 @@ if history is None:
     raise RuntimeError("Training did not produce a history.")
 
 else:
-    # =========================
-    # PLOT LOSS
-    # =========================
     plt.figure(figsize=(10, 4))
     plt.plot(history.history['loss'], label='Train Loss')
     plt.plot(history.history['val_loss'], label='Val Loss')
@@ -384,9 +462,6 @@ else:
     plt.legend()
     plt.show()
 
-    # =========================
-    # EVALUASI
-    # =========================
     scaler = load('minmax_scaler.joblib')
 
     predictions = best_model.predict(X_test)
@@ -403,10 +478,6 @@ else:
     print(f"RMSE : {rmse:.5f}")
     print(f"MAPE : {mape:.2f}%")
     print(f"R2   : {r2:.5f}")
-
-    # =========================
-    # VISUALISASI
-    # =========================
 
     plt.figure(figsize=(14, 6))
     plt.plot(actual_prices, label='Actual', color='black')

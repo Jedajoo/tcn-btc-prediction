@@ -111,10 +111,10 @@ def build_tcn_model(input_shape, n_filters, k_size, dropout, learning_rate, n_fu
     return model
 
 # Define Early Stopping callback
-def get_early_stopping():
+def get_early_stopping(patience=100):
     return EarlyStopping(
         monitor='val_loss',  # Monitor validation loss
-        patience=100,         # Number of epochs with no improvement after which training will be stopped
+        patience=patience,         # Number of epochs with no improvement after which training will be stopped
         restore_best_weights=True # Restore model weights from the epoch with the best value of the monitored quantity.
     )
 
