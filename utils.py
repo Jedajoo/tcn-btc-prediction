@@ -115,7 +115,7 @@ def get_early_stopping(patience=30, monitor='val_loss'):
         monitor=monitor,
         patience=patience,
         restore_best_weights=True,
-        verbose=0
+        verbose=1
     )
 
 def compute_classification_metrics(y_true, y_prob, threshold=0.5):

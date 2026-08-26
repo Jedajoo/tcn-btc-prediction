@@ -167,7 +167,7 @@ def objective_function(params, train_features, train_target):
             batch_size=hp["batch_size"],
             shuffle=False,
             callbacks=[early_stop],
-            verbose=0
+            verbose=1
         )
 
         best_val_loss = min(history.history['val_loss'])
@@ -430,7 +430,7 @@ print("\n--- Generating Multi-Seed Ensemble Predictions ---")
 individual_predictions = []
 
 for idx, model in enumerate(seed_models):
-    prob_pred = model.predict(X_test_final, verbose=0).ravel()
+    prob_pred = model.predict(X_test_final, verbose=1).ravel()
     individual_predictions.append(prob_pred)
     seed_metrics = ut.compute_classification_metrics(y_test_final, prob_pred)
     print(f"Seed {seed_list[idx]}: Acc={seed_metrics['accuracy']*100:.2f}%, AUC={seed_metrics['auc']:.4f}, LogLoss={seed_metrics['log_loss']:.4f}")
