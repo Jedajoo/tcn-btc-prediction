@@ -27,27 +27,37 @@ def create_sequences(features, target, window):
         y.append(target[i + window - 1])
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
+def compute_receptive_field(k_size, dilations=(1, 2, 4, 8, 16), nb_stacks=1):
+    """
+    Computes theoretical receptive field for a 1D causal TCN:
+    RF = 1 + 2 * (k - 1) * nb_stacks * sum(dilations)
+    """
+    return 1 + 2 * (int(k_size) - 1) * int(nb_stacks) * sum(dilations)
+
 def build_tcn_attention_model(
     input_shape,
     n_filters,
     k_size,
     dropout,
     learning_rate,
-    weight_decay=1e-4
+    weight_decay=1e-4,
+    dilations=None
 ):
     """
     Builds a TCN model with Multi-Head Attention, Layer Normalization,
     and GlobalAveragePooling1D for binary directional classification.
     """
+    if dilations is None:
+        dilations = [1, 2, 4, 8, 16]
+
     inputs = layers.Input(shape=input_shape, name="input_sequence")
     
     # 1. Temporal Convolutional Network with sequence output
-    # Dilations [1, 2, 4, 8] cover a receptive field of ~31 timesteps with kernel 2 or 3
     tcn_out = TCN(
         nb_filters=int(n_filters),
         kernel_size=int(k_size),
         nb_stacks=1,
-        dilations=[1, 2, 4, 8],
+        dilations=dilations,
         padding='causal',
         use_skip_connections=True,
         dropout_rate=float(dropout),

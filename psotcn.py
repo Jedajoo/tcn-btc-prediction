@@ -50,10 +50,34 @@ test_dates = test_tab["dates"]
 n_features = train_features.shape[1]
 print(f"Loaded tabular data: Train samples={len(train_features)}, Test samples={len(test_features)}, Features={n_features}")
 
-# Discrete allowed sets for kernel_size and batch_size
-# Strict constraint: kernel_size boundaries do NOT include 4, only [2, 3, 5]
+# Discrete allowed sets for kernel_size and time_window
+# Strict constraints:
+# 1. time_window strictly in [64, 128, 256]
+# 2. kernel_size strictly in [2, 3, 5] (no 4)
+# 3. Paired search strictly where time_window >= receptive_field
+# 4. batch_size strictly fixed to 32
+ALLOWED_WINDOWS = [64, 128, 256]
 ALLOWED_KERNELS = [2, 3, 5]
-ALLOWED_BATCH_SIZES = [16, 32, 64]
+FIXED_BATCH_SIZE = 32
+DEFAULT_DILATIONS = [1, 2, 4, 8, 16]
+
+# Build all valid pairs (k, w) where w >= receptive_field(k)
+VALID_KW_PAIRS = []
+for w in ALLOWED_WINDOWS:
+    for k in ALLOWED_KERNELS:
+        rf = ut.compute_receptive_field(k, DEFAULT_DILATIONS)
+        if w >= rf:
+            VALID_KW_PAIRS.append({
+                "kernel_size": k,
+                "time_window": w,
+                "receptive_field": rf,
+                "dilations": DEFAULT_DILATIONS
+            })
+
+print(f"\nFixed Batch Size: {FIXED_BATCH_SIZE}")
+print("--- Valid (Kernel Size, Time Window) Pairs (Window >= Receptive Field) ---")
+for idx, pair in enumerate(VALID_KW_PAIRS):
+    print(f"  [{idx}] Kernel = {pair['kernel_size']}, Window = {pair['time_window']:3d} | Receptive Field = {pair['receptive_field']:3d} ({pair['time_window']} >= {pair['receptive_field']})")
 
 def decode_hyperparameters(p):
     """
@@ -70,19 +94,16 @@ def decode_hyperparameters(p):
     log_lr = float(np.clip(p[2], -4.5, -2.5))
     learning_rate = 10.0 ** log_lr
 
-    # 3. kernel_size strictly in [2, 3, 5] (no 4)
-    k_idx = int(np.clip(np.floor(p[3]), 0, len(ALLOWED_KERNELS) - 1))
-    k_size = ALLOWED_KERNELS[k_idx]
+    # 3. Paired (kernel_size, time_window) search strictly satisfying window >= receptive_field
+    pair_idx = int(np.clip(np.floor(p[3]), 0, len(VALID_KW_PAIRS) - 1))
+    kw_pair = VALID_KW_PAIRS[pair_idx]
+    k_size = kw_pair["kernel_size"]
+    time_window = kw_pair["time_window"]
+    receptive_field = kw_pair["receptive_field"]
+    dilations = kw_pair["dilations"]
 
-    # 4. batch_size in [16, 32, 64]
-    b_idx = int(np.clip(np.floor(p[4]), 0, len(ALLOWED_BATCH_SIZES) - 1))
-    batch_size = ALLOWED_BATCH_SIZES[b_idx]
-
-    # 5. time_window integer in [15, 60]
-    time_window = int(np.clip(round(p[5]), 15, 60))
-
-    # 6. weight_decay
-    log_wd = float(np.clip(p[6], -5.0, -2.0))
+    # 4. weight_decay
+    log_wd = float(np.clip(p[4], -5.0, -2.0))
     weight_decay = 10.0 ** log_wd
 
     return {
@@ -90,12 +111,13 @@ def decode_hyperparameters(p):
         "dropout": dropout,
         "learning_rate": learning_rate,
         "kernel_size": k_size,
-        "batch_size": batch_size,
         "time_window": time_window,
+        "receptive_field": receptive_field,
+        "dilations": dilations,
+        "batch_size": FIXED_BATCH_SIZE,
         "weight_decay": weight_decay,
+        "pair_idx": pair_idx,
         "log_lr": log_lr,
-        "k_idx": k_idx,
-        "b_idx": b_idx,
         "log_wd": log_wd
     }
 
@@ -131,20 +153,21 @@ def objective_function(params, train_features, train_target):
             k_size=hp["kernel_size"],
             dropout=hp["dropout"],
             learning_rate=hp["learning_rate"],
-            weight_decay=hp["weight_decay"]
+            weight_decay=hp["weight_decay"],
+            dilations=hp["dilations"]
         )
 
-        early_stop = ut.get_early_stopping(patience=15, monitor='val_loss')
+        early_stop = ut.get_early_stopping(patience=20, monitor='val_loss')
 
         history = model.fit(
             X_tr,
             y_tr,
             validation_data=(X_val, y_val),
-            epochs=40,
+            epochs=50,
             batch_size=hp["batch_size"],
             shuffle=False,
             callbacks=[early_stop],
-            verbose=1
+            verbose=0
         )
 
         best_val_loss = min(history.history['val_loss'])
@@ -160,9 +183,10 @@ def objective_function(params, train_features, train_target):
 
     print(
         f"  [Eval] Filters={hp['n_filters']}, K={hp['kernel_size']}, "
+        f"Window={hp['time_window']} (RF={hp['receptive_field']}), "
         f"Drop={hp['dropout']:.3f}, LR={hp['learning_rate']:.5f}, "
-        f"Batch={hp['batch_size']}, Window={hp['time_window']}, "
-        f"WD={hp['weight_decay']:.5f} | ValLoss={mean_loss:.4f} (std={std_loss:.4f}) | Fitness={fitness:.4f}"
+        f"Batch={hp['batch_size']}, WD={hp['weight_decay']:.5f} | "
+        f"ValLoss={mean_loss:.4f} (std={std_loss:.4f}) | Fitness={fitness:.4f}"
     )
 
     return fitness
@@ -174,21 +198,17 @@ CHECKPOINT_DIR = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 PSO_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "pso_state.pkl")
 
-# Boundaries for the 7 parameters:
+# Boundaries for the 5 parameters:
 # [0] n_filters: [32, 256]
 # [1] dropout: [0.01, 0.40]
 # [2] log_lr: [-4.5, -2.5]
-# [3] kernel_idx: [0.0, 2.999] (maps strictly to [2, 3, 5])
-# [4] batch_idx: [0.0, 2.999] (maps to [16, 32, 64])
-# [5] time_window: [15, 60]
-# [6] log_weight_decay: [-5.0, -2.0]
+# [3] kw_pair_idx: [0.0, len(VALID_KW_PAIRS) - 1e-4] (maps to valid (K, W) pairs)
+# [4] log_weight_decay: [-5.0, -2.0]
 boundaries = [
     (32, 256),
     (0.01, 0.40),
     (-4.5, -2.5),
-    (0.0, 2.999),
-    (0.0, 2.999),
-    (15, 60),
+    (0.0, len(VALID_KW_PAIRS) - 1e-4),
     (-5.0, -2.0)
 ]
 
@@ -224,8 +244,8 @@ def load_pso_checkpoint():
         return None
 
 # PSO Configuration
-n_particles = 10
-n_iterations = 15
+n_particles = 20
+n_iterations = 30
 c1 = 1.8
 c2 = 2.2
 
@@ -366,7 +386,8 @@ for seed in seed_list:
             k_size=best_hp["kernel_size"],
             dropout=best_hp["dropout"],
             learning_rate=best_hp["learning_rate"],
-            weight_decay=best_hp["weight_decay"]
+            weight_decay=best_hp["weight_decay"],
+            dilations=best_hp.get("dilations", [1, 2, 4, 8, 16])
         )
 
         early_stopping = ut.get_early_stopping(patience=40, monitor='val_loss')
