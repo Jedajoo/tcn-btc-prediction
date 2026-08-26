@@ -175,7 +175,7 @@ np.savez(
     prices=train_df['Adj Close'].values,
     next_prices=train_df['Next_Adj_Close'].values,
     returns=train_df['Next_Return'].values,
-    dates=train_df.index.strftime('%Y-%m-%d').values
+    dates=train_df.index.strftime('%Y-%m-%d').to_numpy(dtype='U10')
 )
 
 np.savez(
@@ -185,7 +185,7 @@ np.savez(
     prices=test_df['Adj Close'].values,
     next_prices=test_df['Next_Adj_Close'].values,
     returns=test_df['Next_Return'].values,
-    dates=test_df.index.strftime('%Y-%m-%d').values,
+    dates=test_df.index.strftime('%Y-%m-%d').to_numpy(dtype='U10'),
     train_tail_features=train_features_scaled[-65:]  # Buffer for lookback sequence creation
 )
 
