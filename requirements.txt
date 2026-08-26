@@ -1,10 +1,10 @@
-IPython
-panda
+ipython
+pandas
 numpy
 yfinance
 matplotlib
 scikit-learn
-tensorflow[and-cuda]
+tensorflow
 keras-tcn
 keras
-gc
+joblib

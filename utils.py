@@ -3,126 +3,192 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 from tensorflow.keras.callbacks import EarlyStopping
 from tcn import TCN
-from IPython.display import display
+from sklearn.metrics import (
+    accuracy_score,
+    roc_auc_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    log_loss,
+    brier_score_loss,
+    confusion_matrix
+)
 
-def create_sequences(data, window):
+def create_sequences(features, target, window):
+    """
+    Creates (samples, window, features) and corresponding 1-step-ahead target.
+    """
+    features = np.asarray(features)
+    target = np.asarray(target)
+    
     X, y = [], []
-    for i in range(len(data) - window):
-        X.append(data.iloc[i : (i + window)].values)
-        # Target: Harga 'Adj Close' (kolom pertama) pada hari berikutnya
-        y.append(data.iloc[i + window, 0])
-    return np.array(X), np.array(y)
+    for i in range(len(features) - window + 1):
+        X.append(features[i : (i + window)])
+        y.append(target[i + window - 1])
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
-def create_train_test(data):
-    # Tentukan ukuran training set (70% dari total data)
-    train_size = int(len(data) * 0.7)
-
-    # Bagi data menjadi training dan testing set berdasarkan urutan waktu
-    train_df = data.iloc[:train_size]
-    test_df = data.iloc[train_size:]
-
-    print(f"Ukuran Training Set: {len(train_df)} baris")
-    print(f"Ukuran Testing Set: {len(test_df)} baris")
-
-    print("\nHead Training Set:")
-    display(train_df.head())
-
-    print("\nHead Testing Set:")
-    display(test_df.head())
-
-    train_df.to_csv('train.csv', index=True)
-    test_df.to_csv('test.csv', index=True)
-
-    # Membuat sekuens untuk data training
-    time_window = 30
-    X_train, y_train = create_sequences(train_df, time_window)
-
-    # Membuat sekuens untuk data testing
-    X_test, y_test = create_sequences(test_df, time_window)
-
-    print(f"Bentuk X_train: {X_train.shape} (Samples, Time Steps, Features)")
-    print(f"Bentuk y_train: {y_train.shape}")
-    print(f"Bentuk X_test: {X_test.shape}")
-    print(f"Bentuk y_test: {y_test.shape}")
-
-    return X_train, y_train, X_test, y_test
-
-def inverse_transform_target(scaled_val, scaler_obj, n_features):
+def build_tcn_attention_model(
+    input_shape,
+    n_filters,
+    k_size,
+    dropout,
+    learning_rate,
+    weight_decay=1e-4
+):
     """
-    Mengembalikan nilai yang sudah di-scale (MinMaxScaler) ke harga asli.
-    Asumsi: Target ('Adj Close') berada pada indeks kolom 0.
+    Builds a TCN model with Multi-Head Attention, Layer Normalization,
+    and GlobalAveragePooling1D for binary directional classification.
     """
-    # Buat array dummy dengan jumlah kolom yang sama saat scaling (14 kolom)
-    dummy = np.zeros((len(scaled_val), n_features))
-    # Masukkan nilai yang ingin di-inverse ke kolom pertama (Adj Close)
-    dummy[:, 0] = scaled_val.flatten()
-    # Lakukan inverse transform
-    inverse = scaler_obj.inverse_transform(dummy)
-    # Ambil kembali kolom pertama
-    return inverse[:, 0]
-
-# 1. Membangun Arsitektur Model TCN
-# TCN() layer menangani konvolusi temporal, dilasi, dan residual connections
-def build_tcn_model(input_shape, n_filters, k_size, dropout, learning_rate, n_future=1):
-
-    inputs = layers.Input(shape=input_shape)
-    x = TCN(
+    inputs = layers.Input(shape=input_shape, name="input_sequence")
+    
+    # 1. Temporal Convolutional Network with sequence output
+    # Dilations [1, 2, 4, 8] cover a receptive field of ~31 timesteps with kernel 2 or 3
+    tcn_out = TCN(
         nb_filters=int(n_filters),
         kernel_size=int(k_size),
         nb_stacks=1,
-        dilations=[1, 2, 4, 8, 16],
+        dilations=[1, 2, 4, 8],
         padding='causal',
         use_skip_connections=True,
-        dropout_rate=dropout,
-        return_sequences=False
+        dropout_rate=float(dropout),
+        return_sequences=True,
+        name="tcn_layer"
     )(inputs)
 
-    # =========================
-    # IMPROVED DENSE BLOCK
-    # =========================
-    
-    # Dense 1 (lebih besar untuk menangkap kompleksitas)
-    x = layers.Dense(128)(x)
-    x = layers.Activation('relu')(x)
-    x = layers.Dropout(dropout)(x)
+    # 2. Multi-Head Temporal Self-Attention
+    num_heads = 2
+    key_dim = max(16, int(n_filters // num_heads))
+    attn_out = layers.MultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=key_dim,
+        name="temporal_mha"
+    )(tcn_out, tcn_out)
 
-    # Dense 2
-    x = layers.Dense(64)(x)
-    x = layers.Activation('relu')(x)
-    x = layers.Dropout(dropout)(x)
+    # Residual Connection + Layer Normalization
+    x = layers.Add(name="attn_residual")([tcn_out, attn_out])
+    x = layers.LayerNormalization(name="layer_norm")(x)
 
-    x = layers.Dense(32)(x)
-    x = layers.Activation('relu')(x)
+    # 3. Global Average Pooling (replaces deep dense stack to reduce overfitting)
+    x = layers.GlobalAveragePooling1D(name="global_avg_pool")(x)
 
-    # =========================
-    # OUTPUT LAYER
-    # =========================
-    outputs = layers.Dense(n_future, activation='linear')(x)
+    # 4. Classification Head
+    x = layers.Dense(32, activation='gelu', name="dense_projection")(x)
+    x = layers.Dropout(float(dropout), name="head_dropout")(x)
 
-    # =========================
-    # MODEL
-    # =========================
-    model = Model(inputs=inputs, outputs=outputs)
+    # 5. Output Layer: Probability of UP (1) vs DOWN (0)
+    outputs = layers.Dense(1, activation='sigmoid', name="direction_probability")(x)
+
+    model = Model(inputs=inputs, outputs=outputs, name="PSO_TCN_Attention_Classifier")
+
+    # Optimizer with decoupled weight decay (AdamW)
+    optimizer = tf.keras.optimizers.AdamW(
+        learning_rate=float(learning_rate),
+        weight_decay=float(weight_decay)
+    )
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss=tf.keras.losses.Huber()
+        optimizer=optimizer,
+        loss=tf.keras.losses.BinaryCrossentropy(),
+        metrics=[
+            'accuracy',
+            tf.keras.metrics.AUC(name='auc')
+        ]
     )
+
     return model
 
-# Define Early Stopping callback
-def get_early_stopping(patience=100):
+def get_early_stopping(patience=30, monitor='val_loss'):
+    """
+    Returns EarlyStopping callback with weight restoration.
+    """
     return EarlyStopping(
-        monitor='val_loss',  # Monitor validation loss
-        patience=patience,         # Number of epochs with no improvement after which training will be stopped
-        restore_best_weights=True # Restore model weights from the epoch with the best value of the monitored quantity.
+        monitor=monitor,
+        patience=patience,
+        restore_best_weights=True,
+        verbose=0
     )
 
-def mean_absolute_percentage_error(y_true, y_pred):
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+def compute_classification_metrics(y_true, y_prob, threshold=0.5):
+    """
+    Computes comprehensive binary classification metrics.
+    """
+    y_true = np.asarray(y_true).ravel()
+    y_prob = np.asarray(y_prob).ravel()
+    y_pred = (y_prob >= threshold).astype(int)
 
-def smape(y_true, y_pred):
-    return np.mean(
-        2 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred))
-    ) * 100
+    acc = accuracy_score(y_true, y_pred)
+    
+    # Handle single class edge case in ROC-AUC
+    if len(np.unique(y_true)) > 1:
+        auc = roc_auc_score(y_true, y_prob)
+    else:
+        auc = 0.5
+
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    brier = brier_score_loss(y_true, y_prob)
+    loss = log_loss(y_true, np.clip(y_prob, 1e-7, 1 - 1e-7))
+    cm = confusion_matrix(y_true, y_pred)
+
+    # Confidence calculation: distance from decision boundary (0.5)
+    confidence = np.abs(y_prob - 0.5) * 2.0  # Range [0.0, 1.0]
+    
+    # High confidence subset metrics (> 0.60 certainty)
+    high_conf_mask = confidence >= 0.20  # prob >= 0.60 or <= 0.40
+    if np.sum(high_conf_mask) > 0:
+        high_conf_acc = accuracy_score(y_true[high_conf_mask], y_pred[high_conf_mask])
+        high_conf_coverage = np.mean(high_conf_mask) * 100.0
+    else:
+        high_conf_acc = acc
+        high_conf_coverage = 0.0
+
+    return {
+        "accuracy": acc,
+        "auc": auc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "brier_score": brier,
+        "log_loss": loss,
+        "confusion_matrix": cm,
+        "confidence_mean": np.mean(confidence) * 100.0,
+        "high_conf_acc": high_conf_acc,
+        "high_conf_coverage": high_conf_coverage
+    }
+
+def backtest_directional_strategy(actual_returns, y_prob, threshold=0.5, fee=0.0005):
+    """
+    Simulates a long-or-cash trading strategy based on model directional probability.
+    - Long when y_prob >= threshold, Cash (0 return) otherwise.
+    - Applies transaction fee on position switches.
+    """
+    actual_returns = np.asarray(actual_returns).ravel()
+    y_prob = np.asarray(y_prob).ravel()
+
+    signals = (y_prob >= threshold).astype(int)
+    
+    # Strategy returns: when signal is 1, earn actual_returns; otherwise 0
+    strategy_returns = signals * actual_returns
+
+    # Subtract transaction fees on position changes
+    position_changes = np.abs(np.diff(signals, prepend=signals[0]))
+    strategy_returns -= position_changes * fee
+
+    # Cumulative returns
+    cum_market = np.cumprod(1.0 + actual_returns) - 1.0
+    cum_strategy = np.cumprod(1.0 + strategy_returns) - 1.0
+
+    # Sharpe ratio (assuming 365 trading days for crypto, 0% risk-free rate)
+    mean_strat = np.mean(strategy_returns)
+    std_strat = np.std(strategy_returns) + 1e-9
+    sharpe = (mean_strat / std_strat) * np.sqrt(365)
+
+    return {
+        "cumulative_market": cum_market,
+        "cumulative_strategy": cum_strategy,
+        "total_strategy_return": cum_strategy[-1] * 100.0 if len(cum_strategy) > 0 else 0.0,
+        "total_market_return": cum_market[-1] * 100.0 if len(cum_market) > 0 else 0.0,
+        "sharpe_ratio": sharpe,
+        "signals": signals
+    }

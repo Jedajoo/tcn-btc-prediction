@@ -1,222 +1,231 @@
-from IPython.display import display
+import os
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import RobustScaler
 import matplotlib.pyplot as plt
 from joblib import dump
+
+# Ensure output directories exist
+os.makedirs('output/data', exist_ok=True)
+os.makedirs('output/scaler', exist_ok=True)
+os.makedirs('output/plots', exist_ok=True)
+os.makedirs('output/model', exist_ok=True)
+os.makedirs('checkpoints/seeds', exist_ok=True)
 
 ticker = 'BTC-USD'
 start_date = '2022-01-01'
 end_date = '2026-01-01'
-time_window = 30 
-# Menggunakan 30 timestep sebelumnya untuk memprediksi harga pada timestep berikutnya
+time_window = 30  # Default sequence window
 
+print(f"Downloading historical data for {ticker} from {start_date} to {end_date}...")
 df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=False)
-df = df.drop(columns=['Close'])
 
-# Check if there are any zeros or negative values in Volume
-zeros_count = (df['Volume'] == 0).sum()
-negatives_count = (df['Volume'] < 0).sum()
-
-print(f"Jumlah Volume bernilai 0: {zeros_count.values[0]}")
-print(f"Jumlah Volume bernilai negatif: {negatives_count.values[0]}")
-
-# Menghilangkan Volume yang <= 0
-df_filtered = df[df['Volume'] > 0]
-df_filtered = df_filtered.dropna()
-
-print(f"Jumlah baris sebelum filter: {len(df)}")
-print(f"Jumlah baris setelah filter: {len(df_filtered)}")
-display(df_filtered.head())
-
-df = df_filtered
-
-# Check for missing values
-missing_values = df_filtered.isnull().sum()
-print("Missing values per column:")
-print(missing_values)
-
-# Remove rows with missing values
-df_cleaned = df_filtered.dropna()
-
-df = pd.DataFrame(df_cleaned.xs(ticker, axis=1, level='Ticker'))
-
-print(f"\nJumlah baris sebelum menghapus missing values: {len(df_filtered)}")
-print(f"Jumlah baris setelah menghapus missing values: {len(df_cleaned)}")
-
-# Meratakan kolom MultiIndex
-# Mengambil level terakhir dari MultiIndex untuk mendapatkan nama kolom yang datar
+# Flatten MultiIndex columns if present
 if isinstance(df.columns, pd.MultiIndex):
-    df.columns = df.columns.get_level_values(-1)
+    if ticker in df.columns.levels[1]:
+        df = df.xs(ticker, axis=1, level='Ticker')
+    else:
+        df.columns = df.columns.get_level_values(-1)
 
-# Mengubah indeks 'Date' menjadi kolom biasa
+# Drop redundant 'Close' if 'Adj Close' is present
+if 'Close' in df.columns and 'Adj Close' in df.columns:
+    df = df.drop(columns=['Close'])
+elif 'Close' in df.columns and 'Adj Close' not in df.columns:
+    df['Adj Close'] = df['Close']
+    df = df.drop(columns=['Close'])
 
-df.to_csv('output/data/dataset.csv', index=True)
+# Filter invalid volume rows
+df_filtered = df[df['Volume'] > 0].dropna()
+print(f"Data count after filtering volume and missing values: {len(df_filtered)}")
+df = df_filtered.copy()
 
-# Menghitung SMA dengan jendela dinamis (expanding window) di awal
-# min_periods=1 memastikan perhitungan dimulai dari data pertama yang tersedia
+# ==========================================
+# 1. TECHNICAL INDICATORS & FEATURE ENGINEERING
+# ==========================================
 close_s = df['Adj Close'].squeeze()
+high_s = df['High'].squeeze()
+low_s = df['Low'].squeeze()
+open_s = df['Open'].squeeze()
+vol_s = df['Volume'].squeeze()
 
-df['SMA10'] = close_s.rolling(10).mean()
-df['SMA25'] = close_s.rolling(25).mean()
+# A. Moving Averages
+df['SMA10'] = close_s.rolling(10, min_periods=1).mean()
+df['SMA25'] = close_s.rolling(25, min_periods=1).mean()
 
+# B. MACD (12, 26, 9)
 ema_12 = close_s.ewm(span=12, min_periods=1).mean()
 ema_26 = close_s.ewm(span=26, min_periods=1).mean()
-
-# Menghitung MACD Line
 df['MACD Line'] = ema_12 - ema_26
 df['MACD Signal'] = df['MACD Line'].ewm(span=9, min_periods=1).mean()
+df['MACD Hist'] = df['MACD Line'] - df['MACD Signal']
 
-# Menghitung RSI dengan jendela dinamis
+# C. RSI (14)
 delta = close_s.diff()
-
-gain = delta.where(delta > 0, 0)
-loss = -delta.where(delta < 0, 0)
-
-# Menggunakan Wilder's Smoothing (EWM) dengan min_periods=1
+gain = delta.where(delta > 0, 0.0)
+loss = -delta.where(delta < 0, 0.0)
 avg_gain = gain.ewm(alpha=1/14, min_periods=1).mean()
 avg_loss = loss.ewm(alpha=1/14, min_periods=1).mean()
+rs = avg_gain / (avg_loss + 1e-9)
+df['RSI'] = 100.0 - (100.0 / (1.0 + rs))
+df['RSI'] = df['RSI'].replace([np.inf, -np.inf], np.nan).ffill().bfill()
 
-# Menghitung RSI
-rs = avg_gain / avg_loss
-df['RSI'] = 100 - (100 / (1 + rs))
-
-# Mengisi RSI yang bernilai 0 dan NaN dengan RSI positif terdekat
-# 1. Ganti semua 0 dengan NaN agar dapat diisi oleh ffill/bfill
-df['RSI'] = df['RSI'].replace(0, np.nan)
-
-# 2. Gunakan ffill (forward fill) untuk mengisi NaN dengan nilai positif terdekat sebelumnya
-# 3. Gunakan bfill (backward fill) untuk mengisi NaN di awal (jika ada) dengan nilai positif terdekat setelahnya
-df['RSI'] = df['RSI'].replace([np.inf, -np.inf], np.nan)
-
-print("RSI berhasil dihitung tanpa missing values, dengan nilai 0 diisi oleh RSI positif terdekat.")
-
-std_dev = close_s.rolling(20).std(ddof=0)
-m_band = close_s.rolling(20).mean()
-
-# Menambahkan Bollinger Bands ke DataFrame
+# D. Bollinger Bands (20, 2)
+std_dev = close_s.rolling(20, min_periods=1).std(ddof=0).fillna(0)
+m_band = close_s.rolling(20, min_periods=1).mean()
 df['Upper BBand'] = m_band + 2 * std_dev
 df['Lower BBand'] = m_band - 2 * std_dev
-
 df['Band Width'] = df['Upper BBand'] - df['Lower BBand']
-df['Band %'] = (close_s - df['Lower BBand']) / df['Band Width']
-df[['Band Width', 'Band %']] = df[['Band Width', 'Band %']].replace(0, np.nan)
-df[['Band Width', 'Band %']] = df[['Band Width', 'Band %']].replace([np.inf, -np.inf], np.nan)
+df['Band %'] = (close_s - df['Lower BBand']) / (df['Band Width'] + 1e-9)
+df[['Band Width', 'Band %']] = df[['Band Width', 'Band %']].replace([np.inf, -np.inf], np.nan).ffill().bfill()
 
-print("Bollinger Bands berhasil ditambahkan ke DataFrame.")
+# E. Garman-Klass Volatility
+log_hl = np.log(np.maximum(high_s / (low_s + 1e-9), 1e-9))
+log_co = np.log(np.maximum(close_s / (open_s + 1e-9), 1e-9))
+gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
+df['GK_Vol'] = np.sqrt(np.maximum(gk_var, 0.0))
+df['GK_Vol_14'] = df['GK_Vol'].rolling(14, min_periods=1).mean()
 
+# F. Chaikin Money Flow (CMF 20)
+hl_diff = (high_s - low_s).replace(0, np.nan)
+mf_multiplier = ((close_s - low_s) - (high_s - close_s)) / (hl_diff + 1e-9)
+mf_multiplier = mf_multiplier.fillna(0.0)
+mf_volume = mf_multiplier * vol_s
+df['CMF'] = mf_volume.rolling(20, min_periods=1).sum() / (vol_s.rolling(20, min_periods=1).sum() + 1e-9)
+df['CMF'] = df['CMF'].replace([np.inf, -np.inf], np.nan).ffill().bfill()
+
+# G. Stochastic Oscillator (%K, %D 14, 3)
+lowest_low_14 = low_s.rolling(14, min_periods=1).min()
+highest_high_14 = high_s.rolling(14, min_periods=1).max()
+stoch_range = (highest_high_14 - lowest_low_14).replace(0, np.nan)
+df['Stoch_K'] = ((close_s - lowest_low_14) / (stoch_range + 1e-9)) * 100.0
+df['Stoch_K'] = df['Stoch_K'].replace([np.inf, -np.inf], np.nan).ffill().bfill()
+df['Stoch_D'] = df['Stoch_K'].rolling(3, min_periods=1).mean().ffill().bfill()
+
+# H. Calendar / Cyclical Features
+day_of_week = df.index.dayofweek
+day_of_month = df.index.day
+month = df.index.month
+
+df['DayOfWeek_Sin'] = np.sin(2 * np.pi * day_of_week / 7.0)
+df['DayOfWeek_Cos'] = np.cos(2 * np.pi * day_of_week / 7.0)
+df['Month_Sin'] = np.sin(2 * np.pi * (month - 1) / 12.0)
+df['Month_Cos'] = np.cos(2 * np.pi * (month - 1) / 12.0)
+df['DayOfMonth_Sin'] = np.sin(2 * np.pi * (day_of_month - 1) / 31.0)
+df['DayOfMonth_Cos'] = np.cos(2 * np.pi * (day_of_month - 1) / 31.0)
+df['Is_Weekend'] = (day_of_week >= 5).astype(float)
+
+# ==========================================
+# 2. TARGET CREATION (DIRECTIONAL MOVEMENT)
+# ==========================================
+# Next day close price, return, and binary direction
+df['Next_Adj_Close'] = close_s.shift(-1)
+df['Next_Return'] = (df['Next_Adj_Close'] - close_s) / close_s
+# Target: 1 for UP, 0 for DOWN (or flat)
+df['Target_Direction'] = (df['Next_Adj_Close'] > close_s).astype(int)
+
+# Drop last row since it doesn't have Next_Adj_Close
 df = df.dropna()
 
-print("Jumlah missing values setelah perbaikan:")
-print(df.isnull().sum())
+print(f"\nDataset shape after indicator calculations: {df.shape}")
+up_count = (df['Target_Direction'] == 1).sum()
+down_count = (df['Target_Direction'] == 0).sum()
+print(f"Target Distribution: UP={up_count} ({up_count/len(df)*100:.2f}%), DOWN={down_count} ({down_count/len(df)*100:.2f}%)")
 
-# Memperbaiki height_ratios agar berjumlah 4 sesuai dengan jumlah subplot (ax1, ax2, ax3, ax4)
-fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(14, 12), sharex=True, gridspec_kw={'height_ratios': [2, 1, 1, 2]})
+# Save full processed tabular dataset
+df.to_csv('output/data/dataset.csv', index=True)
 
-# Plot Harga dan Moving Averages
-ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.6)
-ax1.plot(df.index, df['SMA10'], label='SMA 10', linestyle='--')
-ax1.plot(df.index, df['SMA25'], label='SMA 25', linestyle='--')
-ax1.set_title(f'Analisis Teknikal {ticker}')
-ax1.legend()
-ax1.grid(True, alpha=0.3)
-
-# Plot MACD
-ax2.plot(df.index, df['MACD Line'], label='MACD Line', color='blue')
-ax2.plot(df.index, df['MACD Signal'], label='Signal Line', color='red')
-ax2.axhline(0, color='black', linewidth=1, linestyle='-')
-ax2.set_title('MACD Indicator')
-ax2.legend()
-ax2.grid(True, alpha=0.3)
-
-# Plot RSI
-ax3.plot(df.index, df['RSI'], label='RSI (14)', color='purple')
-ax3.axhline(70, color='red', linestyle='--', alpha=0.5) # Overbought
-ax3.axhline(30, color='green', linestyle='--', alpha=0.5) # Oversold
-ax3.set_ylim(0, 100)
-ax3.set_title('RSI Indicator')
-ax3.legend()
-ax3.grid(True, alpha=0.3)
-
-#Plot Bband
-ax4.plot(df.index, df['Upper BBand'], label='Upper Band', color='blue')
-ax4.plot(df.index, df['Lower BBand'], label='Lower Band', color='blue')
-ax4.plot(df.index, df['Adj Close'], label='Close', color='green')
-ax4.fill_between(df.index, df['Upper BBand'], df['Lower BBand'], color='blue', alpha=0.1)
-ax4.set_title('Bollinger Bands')
-ax4.legend()
-ax4.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show()
-
-display(df.head())
-
-# Define the full list of technical and price features
-columns_to_scale = [
+# Feature columns list
+feature_cols = [
     'Adj Close', 'High', 'Low', 'Open', 'Volume',
-    'SMA10', 'SMA25', 'MACD Line', 'MACD Signal',
-    'RSI', 'Upper BBand', 'Lower BBand', 'Band Width', 'Band %'
+    'SMA10', 'SMA25', 'MACD Line', 'MACD Signal', 'MACD Hist',
+    'RSI', 'Upper BBand', 'Lower BBand', 'Band Width', 'Band %',
+    'GK_Vol', 'GK_Vol_14', 'CMF', 'Stoch_K', 'Stoch_D',
+    'DayOfWeek_Sin', 'DayOfWeek_Cos', 'Month_Sin', 'Month_Cos',
+    'DayOfMonth_Sin', 'DayOfMonth_Cos', 'Is_Weekend'
 ]
 
-# Save the scaler if needed for inverse transformations later
+print(f"Number of feature columns: {len(feature_cols)}")
 
-# Tentukan ukuran training set (70% dari total data)
+# ==========================================
+# 3. TRAIN / TEST SPLIT & ROBUST SCALING
+# ==========================================
 train_size = int(len(df) * 0.7)
+train_df = df.iloc[:train_size].copy()
+test_df = df.iloc[train_size:].copy()
 
-# Bagi data menjadi training dan testing set berdasarkan urutan waktu
-train_raw = df.iloc[:train_size]
-test_raw = df.iloc[train_size:]
+print(f"Training set: {len(train_df)} rows ({train_df.index[0].date()} to {train_df.index[-1].date()})")
+print(f"Testing set : {len(test_df)} rows ({test_df.index[0].date()} to {test_df.index[-1].date()})")
 
-# Initialize and apply MinMaxScaler
-scaler = MinMaxScaler(feature_range=(0, 1))
-train_scaled = scaler.fit_transform(train_raw[columns_to_scale])
+# Fit RobustScaler ONLY on training feature set
+scaler = RobustScaler(quantile_range=(25.0, 75.0))
+train_features_scaled = scaler.fit_transform(train_df[feature_cols])
+test_features_scaled = scaler.transform(test_df[feature_cols])
 
-test_scaled = scaler.transform(test_raw[columns_to_scale])
+# Save scaler and feature names
+dump(scaler, "output/scaler/feature_scaler.joblib")
+dump(feature_cols, "output/scaler/feature_columns.joblib")
+print("Saved RobustScaler to output/scaler/feature_scaler.joblib")
 
-train_df = pd.DataFrame(train_scaled, columns=columns_to_scale, index=train_raw.index)
+# Save tabular arrays (allows dynamic window evaluation in PSO)
+np.savez(
+    "output/data/train_tabular.npz",
+    features=train_features_scaled,
+    target=train_df['Target_Direction'].values,
+    prices=train_df['Adj Close'].values,
+    next_prices=train_df['Next_Adj_Close'].values,
+    returns=train_df['Next_Return'].values,
+    dates=train_df.index.strftime('%Y-%m-%d').values
+)
 
-test_df = pd.DataFrame(test_scaled, columns=columns_to_scale, index=test_raw.index)
+np.savez(
+    "output/data/test_tabular.npz",
+    features=test_features_scaled,
+    target=test_df['Target_Direction'].values,
+    prices=test_df['Adj Close'].values,
+    next_prices=test_df['Next_Adj_Close'].values,
+    returns=test_df['Next_Return'].values,
+    dates=test_df.index.strftime('%Y-%m-%d').values,
+    train_tail_features=train_features_scaled[-65:]  # Buffer for lookback sequence creation
+)
 
-print(f"Ukuran Training Set: {len(train_df)} baris")
-print(f"Ukuran Testing Set: {len(test_df)} baris")
-
-print("\nHead Training Set:")
-display(train_df.head())
-
-print("\nHead Testing Set:")
-display(test_df.head())
-
-def create_sequences(data, window):
+# ==========================================
+# 4. DEFAULT SEQUENCE GENERATION (WINDOW=30)
+# ==========================================
+def create_sequences_from_arrays(features, target, window):
     X, y = [], []
-    for i in range(len(data) - window):
-        X.append(data.iloc[i : (i + window)].values)
-        # Target: Harga 'Adj Close' (kolom pertama) pada hari berikutnya
-        y.append(data.iloc[i + window, 0])
+    for i in range(len(features) - window + 1):
+        X.append(features[i : (i + window)])
+        y.append(target[i + window - 1])
     return np.array(X), np.array(y)
 
+# For training sequences
+X_train, y_train = create_sequences_from_arrays(
+    train_features_scaled,
+    train_df['Target_Direction'].values,
+    time_window
+)
 
-# Membuat sekuens untuk data testing
-test_input = pd.concat([
-    train_df.tail(time_window),
-    test_df
+# For testing sequences (concatenate train buffer to avoid losing initial test samples)
+test_input_features = np.vstack([
+    train_features_scaled[-time_window+1:],
+    test_features_scaled
+])
+test_input_target = np.concatenate([
+    train_df['Target_Direction'].values[-time_window+1:],
+    test_df['Target_Direction'].values
 ])
 
-X_train, y_train = create_sequences(train_df, time_window)
-X_test, y_test = create_sequences(test_input, time_window)
+X_test, y_test = create_sequences_from_arrays(
+    test_input_features,
+    test_input_target,
+    time_window
+)
 
-def inverse_transform_target(scaled_val, scaler_obj, n_features):
-    # Buat array dummy dengan jumlah kolom yang sama saat scaling (14 kolom)
-    dummy = np.zeros((len(scaled_val), n_features))
-    # Masukkan nilai yang ingin di-inverse ke kolom pertama (Adj Close)
-    dummy[:, 0] = scaled_val.flatten()
-    # Lakukan inverse transform
-    inverse = scaler_obj.inverse_transform(dummy)
-    # Ambil kembali kolom pertama
-    return inverse[:, 0]
+print(f"\nDefault Sequence Shapes (window={time_window}):")
+print(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
+print(f"X_test : {X_test.shape}, y_test : {y_test.shape}")
 
-np.savez("output/data/test_data.npz", X=X_test, y=y_test)
 np.savez("output/data/train_data.npz", X=X_train, y=y_train)
-
-dump(scaler, "output/scaler/train_scaler.joblib")
+np.savez("output/data/test_data.npz", X=X_test, y=y_test)
+print("Data preprocessing completed successfully.")
