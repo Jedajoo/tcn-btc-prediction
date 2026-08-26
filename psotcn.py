@@ -16,7 +16,7 @@ if gpus:
     try:
         tf.config.set_logical_device_configuration(
             gpus[0],
-            [tf.config.LogicalDeviceConfiguration(memory_limit=3072)]
+            [tf.config.LogicalDeviceConfiguration(memory_limit=2072)]
         )
         print(f"GPU configured: {len(gpus)} physical device(s)")
     except RuntimeError as e:
