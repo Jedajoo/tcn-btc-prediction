@@ -32,8 +32,8 @@ ticker = "BTC-USD"
 # ==========================================
 # 1. LOAD TABULAR PREPROCESSED DATA
 # ==========================================
-train_tab = np.load("output/data/train_tabular.npz", allow_pickle=True)
-test_tab = np.load("output/data/test_tabular.npz", allow_pickle=True)
+train_tab = np.load("output/data/train_tabular.npz")
+test_tab = np.load("output/data/test_tabular.npz")
 
 train_features = train_tab["features"]
 train_target = train_tab["target"]
