@@ -22,6 +22,10 @@ models/
 *.pt
 *.pth
 *.onnx
+.joblib
+
+# Output
+output/
 
 # Checkpoints
 checkpoints/

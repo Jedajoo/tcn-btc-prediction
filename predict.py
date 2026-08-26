@@ -4,10 +4,13 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
-from joblib import dump
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from tensorflow.keras.models import load_model
+from joblib import load
+import utils as ut
 
-ticker = 'BTC-USD'
-start_date = '2022-01-01'
+ticker = 'AAPL'
+start_date = '2020-01-01'
 end_date = '2026-01-01'
 time_window = 30 
 # Menggunakan 30 timestep sebelumnya untuk memprediksi harga pada timestep berikutnya
@@ -51,8 +54,6 @@ if isinstance(df.columns, pd.MultiIndex):
     df.columns = df.columns.get_level_values(-1)
 
 # Mengubah indeks 'Date' menjadi kolom biasa
-
-df.to_csv('output/data/dataset.csv', index=True)
 
 # Menghitung SMA dengan jendela dinamis (expanding window) di awal
 # min_periods=1 memastikan perhitungan dimulai dari data pertama yang tersedia
@@ -216,7 +217,29 @@ def inverse_transform_target(scaled_val, scaler_obj, n_features):
     # Ambil kembali kolom pertama
     return inverse[:, 0]
 
-np.savez("output/data/test_data.npz", X=X_test, y=y_test)
-np.savez("output/data/train_data.npz", X=X_train, y=y_train)
+best_model = load_model("output/model/model_tcn_pso.keras")
 
-dump(scaler, "output/scaler/train_scaler.joblib")
+predictions = best_model.predict(X_test)
+pred_prices = ut.inverse_transform_target(predictions, scaler, 14)
+actual_prices = ut.inverse_transform_target(y_test, scaler, 14) 
+
+mae = mean_absolute_error(actual_prices, pred_prices)
+rmse = np.sqrt(mean_squared_error(actual_prices, pred_prices))
+mape = ut.mean_absolute_percentage_error(actual_prices, pred_prices)
+r2 = r2_score(actual_prices, pred_prices)
+
+print("\n--- Evaluasi ---")
+print(f"MAE  : {mae:.5f}")
+print(f"RMSE : {rmse:.5f}")
+print(f"MAPE : {mape:.2f}%")
+print(f"R2   : {r2:.5f}")
+
+plt.figure(figsize=(14, 6))
+plt.plot(actual_prices, label='Actual', color='black')
+plt.plot(pred_prices, label='Predicted (PSO-TCN)', color='green')
+plt.title(f'Prediksi Harga Saham {ticker}')
+plt.legend()
+plt.grid(True)
+
+plt.savefig('output/plots/evaluationAAPL.png', dpi=300, bbox_inches='tight')
+plt.show()

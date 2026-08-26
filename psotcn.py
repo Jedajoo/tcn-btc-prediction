@@ -351,12 +351,12 @@ print("\nPSO Selesai!")
 print(f"Best Loss: {gbest_value:.6f}")
 
 best_n_filters = int(gbest_position[0])
-best_k_size = int(gbest_position[1])
-best_dropout = float(gbest_position[2])
-best_lr = 10 ** gbest_position[3]
+best_dropout = float(gbest_position[1])
+best_lr = 10 ** gbest_position[2]
+kernel_size = 2
 
 print("\nBest Parameter:")
-print(best_n_filters, best_k_size, best_dropout, best_lr)
+print(best_n_filters, best_dropout, best_lr)
 
 print("\nTraining final model...")
 
@@ -372,11 +372,15 @@ SEED_CHECKPOINT_DIR = os.path.join(
 os.makedirs(
     SEED_CHECKPOINT_DIR,
     exist_ok=True
-) 
+)
+
+
 
 for seed in range(42, 47):
     seed_model_path = os.path.join(SEED_CHECKPOINT_DIR,f"model_seed_{seed}.keras")
     seed_loss_path = os.path.join(SEED_CHECKPOINT_DIR,f"loss_seed_{seed}.npy")
+    seed_loss_path = os.path.join(SEED_CHECKPOINT_DIR, f"loss_seed_{seed}.npy")
+    seed_history_path = os.path.join(SEED_CHECKPOINT_DIR, f"history_seed_{seed}.pkl")
 
     if (os.path.exists(seed_model_path) and os.path.exists(seed_loss_path)):
 
@@ -386,8 +390,14 @@ for seed in range(42, 47):
         )
 
         best_val_loss = float(np.load(seed_loss_path))
-        seed_losses.append(best_val_loss)
+        loaded_model = tf.keras.models.load_model(seed_model_path)
 
+        with open(seed_history_path, "rb") as f:
+            loaded_history = pickle.load(f)
+
+        seed_losses.append(best_val_loss)
+        seed_models.append(loaded_model)
+        seed_histories.append(loaded_history)
         continue
 
     print(f"\nTraining seed {seed}")
@@ -397,18 +407,18 @@ for seed in range(42, 47):
     model = ut.build_tcn_model(
         input_shape,
         best_n_filters,
-        best_k_size,
+        kernel_size,
         best_dropout,
         best_lr,
         n_future=1
     )
 
-    early_stopping = ut.get_early_stopping(patience=50)
+    early_stopping = ut.get_early_stopping(patience=100)
 
     history = model.fit(
         X_train,
         y_train,
-        epochs=300,
+        epochs=500,
         batch_size=16,
         validation_split=0.2,
         shuffle=False,
@@ -421,6 +431,9 @@ for seed in range(42, 47):
     model.save(seed_model_path)
     np.save(seed_loss_path, best_val_loss)
 
+    with open(seed_history_path, "wb") as f:
+        pickle.dump(history.history, f)
+
     seed_losses.append(best_val_loss)
     seed_models.append(model)
     seed_histories.append(history)
@@ -428,8 +441,6 @@ for seed in range(42, 47):
     print(f"Seed {seed} → " f"best val loss = {best_val_loss:.6f}")
 
     del model
-    del history
-
     tf.keras.backend.clear_session()
     gc.collect()
 
@@ -449,44 +460,62 @@ best_seed_idx = np.argmin(seed_losses)
 best_model = seed_models[best_seed_idx]
 best_history = seed_histories[best_seed_idx]
 
-best_model.save("model_tcn_pso.keras")
+best_model.save("output/model/model_tcn_pso.keras")
 
-if history is None:
-    raise RuntimeError("Training did not produce a history.")
-
+# --- Penanganan dinamis untuk objek History atau Dictionary ---
+if hasattr(best_history, 'history'):
+    # Jika best_history adalah objek Keras History (training baru)
+    train_loss = best_history.history['loss']
+    val_loss = best_history.history['val_loss']
 else:
-    plt.figure(figsize=(10, 4))
-    plt.plot(history.history['loss'], label='Train Loss')
-    plt.plot(history.history['val_loss'], label='Val Loss')
-    plt.title('TCN Training Loss (PSO Tuned)')
-    plt.legend()
-    plt.show()
+    # Jika best_history sudah berupa dictionary (di-load dari pickle)
+    train_loss = best_history['loss']
+    val_loss = best_history['val_loss']
 
-    scaler = load('minmax_scaler.joblib')
+# Plotting
+plt.figure(figsize=(10, 4))
+plt.plot(train_loss, label='Train Loss')
+plt.plot(val_loss, label='Val Loss')
+plt.title(f'TCN Training Loss (Best Seed {42 + best_seed_idx})')
+plt.legend()
+plt.savefig('output/plots/train_loss.png', dpi=300, bbox_inches='tight')
+plt.show()
 
-    predictions = best_model.predict(X_test)
-    pred_prices = ut.inverse_transform_target(predictions, scaler, 14)
-    actual_prices = ut.inverse_transform_target(y_test, scaler, 14) 
+# Plotting menggunakan best_history
+plt.figure(figsize=(10, 4))
+plt.plot(best_history['loss'], label='Train Loss')
+plt.plot(best_history['val_loss'], label='Val Loss')
+plt.title(f'TCN Training Loss (Best Seed {42 + best_seed_idx})')
+plt.legend()
+plt.savefig('output/plots/train_loss2.png', dpi=300, bbox_inches='tight')
+plt.show()
 
-    mae = mean_absolute_error(actual_prices, pred_prices)
-    rmse = np.sqrt(mean_squared_error(actual_prices, pred_prices))
-    mape = ut.mean_absolute_percentage_error(actual_prices, pred_prices)
-    r2 = r2_score(actual_prices, pred_prices)
+# Evaluasi Prediksi
+scaler = load('output/scaler/train_scaler.joblib')
 
-    print("\n--- Evaluasi ---")
-    print(f"MAE  : {mae:.5f}")
-    print(f"RMSE : {rmse:.5f}")
-    print(f"MAPE : {mape:.2f}%")
-    print(f"R2   : {r2:.5f}")
+predictions = best_model.predict(X_test)
+pred_prices = ut.inverse_transform_target(predictions, scaler, 14)
+actual_prices = ut.inverse_transform_target(y_test, scaler, 14) 
 
-    plt.figure(figsize=(14, 6))
-    plt.plot(actual_prices, label='Actual', color='black')
-    plt.plot(pred_prices, label='Predicted (PSO-TCN)', color='green')
-    plt.title(f'Prediksi Harga Saham {ticker}')
-    plt.legend()
-    plt.grid(True)
+mae = mean_absolute_error(actual_prices, pred_prices)
+rmse = np.sqrt(mean_squared_error(actual_prices, pred_prices))
+mape = ut.mean_absolute_percentage_error(actual_prices, pred_prices)
+r2 = r2_score(actual_prices, pred_prices)
 
-    plt.savefig('evaluation.png', dpi=300, bbox_inches='tight')
-    plt.show()
+print("\n--- Evaluasi ---")
+print(f"MAE  : {mae:.5f}")
+print(f"RMSE : {rmse:.5f}")
+print(f"MAPE : {mape:.2f}%")
+print(f"R2   : {r2:.5f}")
 
-    dump(predictions, 'model_PSO_TCN3.joblib')
+plt.figure(figsize=(14, 6))
+plt.plot(actual_prices, label='Actual', color='black')
+plt.plot(pred_prices, label='Predicted (PSO-TCN)', color='green')
+plt.title(f'Prediksi Harga Saham {ticker}')
+plt.legend()
+plt.grid(True)
+
+plt.savefig('output/plots/evaluation.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+dump(predictions, 'output/model/model_PSO_TCN3.joblib')
