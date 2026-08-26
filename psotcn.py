@@ -144,7 +144,7 @@ def objective_function(params, train_features, train_target):
             batch_size=hp["batch_size"],
             shuffle=False,
             callbacks=[early_stop],
-            verbose=0
+            verbose=1
         )
 
         best_val_loss = min(history.history['val_loss'])
