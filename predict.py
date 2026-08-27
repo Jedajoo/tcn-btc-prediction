@@ -142,21 +142,25 @@ eval_returns = df['Next_Return'].values[time_window-1:]
 # ==========================================
 SEED_CHECKPOINT_DIR = "checkpoints/seeds"
 seed_list = [42, 43, 44, 45, 46]
-seed_models = []
+all_prob_preds = []
 
 for seed in seed_list:
     seed_model_path = os.path.join(SEED_CHECKPOINT_DIR, f"model_seed_{seed}.keras")
     if os.path.exists(seed_model_path):
         model = tf.keras.models.load_model(seed_model_path)
-        seed_models.append(model)
+        prob = model.predict(X_eval, verbose=0).ravel()
+        all_prob_preds.append(prob)
+        del model
+        tf.keras.backend.clear_session()
 
-if len(seed_models) == 0:
+if len(all_prob_preds) == 0:
     print("Warning: No seed models found. Falling back to single model output/model/model_tcn_pso.keras")
     model = tf.keras.models.load_model("output/model/model_tcn_pso.keras")
-    seed_models = [model]
+    all_prob_preds = [model.predict(X_eval, verbose=0).ravel()]
+    del model
+    tf.keras.backend.clear_session()
 
-print(f"Running inference with {len(seed_models)} ensemble model(s)...")
-all_prob_preds = [m.predict(X_eval, verbose=0).ravel() for m in seed_models]
+print(f"Running inference with {len(all_prob_preds)} ensemble prediction(s)...")
 ensemble_probs = np.mean(all_prob_preds, axis=0)
 pred_directions = (ensemble_probs >= 0.5).astype(int)
 confidences = np.abs(ensemble_probs - 0.5) * 2.0 * 100.0

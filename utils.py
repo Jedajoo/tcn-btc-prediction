@@ -107,7 +107,7 @@ def build_tcn_attention_model(
 
     return model
 
-def get_early_stopping(patience=30, monitor='val_loss'):
+def get_early_stopping(patience=30, monitor='val_loss', verbose=0):
     """
     Returns EarlyStopping callback with weight restoration.
     """
@@ -115,7 +115,7 @@ def get_early_stopping(patience=30, monitor='val_loss'):
         monitor=monitor,
         patience=patience,
         restore_best_weights=True,
-        verbose=1
+        verbose=verbose
     )
 
 def compute_classification_metrics(y_true, y_prob, threshold=0.5):

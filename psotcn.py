@@ -10,15 +10,13 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import roc_curve, auc, confusion_matrix, ConfusionMatrixDisplay
 import utils as ut
 
-# Configure GPU memory if available
+# Configure GPU memory with dynamic growth if available
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
-        tf.config.set_logical_device_configuration(
-            gpus[0],
-            [tf.config.LogicalDeviceConfiguration(memory_limit=2072)]
-        )
-        print(f"GPU configured: {len(gpus)} physical device(s)")
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"GPU configured with dynamic memory growth: {len(gpus)} physical device(s)")
     except RuntimeError as e:
         print(f"GPU configuration notice: {e}")
 
@@ -60,6 +58,22 @@ ALLOWED_WINDOWS = [64, 128, 256]
 ALLOWED_KERNELS = [2, 3, 5]
 FIXED_BATCH_SIZE = 32
 DEFAULT_DILATIONS = [1, 2, 4, 8, 16]
+
+# Pre-cache sequence data & temporal validation splits (80/20) for allowed windows
+# Avoids recomputing/copying heavy 3D arrays on every PSO evaluation
+print("Pre-caching sequence splits for allowed window sizes...")
+PRECOMPUTED_DATA = {}
+for w in ALLOWED_WINDOWS:
+    X_all, y_all = ut.create_sequences(train_features, train_target, w)
+    val_size = max(1, int(len(X_all) * 0.20))
+    PRECOMPUTED_DATA[w] = {
+        "X_tr": X_all[:-val_size],
+        "y_tr": y_all[:-val_size],
+        "X_val": X_all[-val_size:],
+        "y_val": y_all[-val_size:],
+        "n_samples": len(X_all)
+    }
+print(f"Pre-cached sequence splits for windows: {list(PRECOMPUTED_DATA.keys())}")
 
 # Build all valid pairs (k, w) where w >= receptive_field(k)
 VALID_KW_PAIRS = []
@@ -124,72 +138,59 @@ def decode_hyperparameters(p):
 # ==========================================
 # 2. PSO OBJECTIVE FUNCTION
 # ==========================================
-def objective_function(params, train_features, train_target):
+def objective_function(params, train_features=None, train_target=None):
     hp = decode_hyperparameters(params)
+    data = PRECOMPUTED_DATA.get(hp["time_window"])
     
-    # Generate sequences dynamically based on time_window
-    X_train, y_train = ut.create_sequences(train_features, train_target, hp["time_window"])
-    
-    if len(X_train) < 100:
+    if data is None or data["n_samples"] < 100:
         return 999.0  # Invalid window penalty
         
-    n_splits = 5
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    folds = list(tscv.split(X_train))
+    X_tr, y_tr = data["X_tr"], data["y_tr"]
+    X_val, y_val = data["X_val"], data["y_val"]
 
-    fold_losses = []
-    input_shape = (hp["time_window"], n_features)
+    set_seed(42)
+    tf.keras.backend.clear_session()
 
-    for fold_idx, (tr_idx, val_idx) in enumerate(folds):
-        X_tr, y_tr = X_train[tr_idx], y_train[tr_idx]
-        X_val, y_val = X_train[val_idx], y_train[val_idx]
+    model = ut.build_tcn_attention_model(
+        input_shape=(hp["time_window"], n_features),
+        n_filters=hp["n_filters"],
+        k_size=hp["kernel_size"],
+        dropout=hp["dropout"],
+        learning_rate=hp["learning_rate"],
+        weight_decay=hp["weight_decay"],
+        dilations=hp["dilations"]
+    )
 
-        set_seed(42 + fold_idx)
-        tf.keras.backend.clear_session()
+    early_stop = ut.get_early_stopping(patience=15, monitor='val_loss', verbose=0)
 
-        model = ut.build_tcn_attention_model(
-            input_shape=input_shape,
-            n_filters=hp["n_filters"],
-            k_size=hp["kernel_size"],
-            dropout=hp["dropout"],
-            learning_rate=hp["learning_rate"],
-            weight_decay=hp["weight_decay"],
-            dilations=hp["dilations"]
-        )
+    history = model.fit(
+        X_tr,
+        y_tr,
+        validation_data=(X_val, y_val),
+        epochs=40,
+        batch_size=hp["batch_size"],
+        shuffle=False,
+        callbacks=[early_stop],
+        verbose=0
+    )
 
-        early_stop = ut.get_early_stopping(patience=20, monitor='val_loss')
+    best_val_loss = float(min(history.history['val_loss']))
 
-        history = model.fit(
-            X_tr,
-            y_tr,
-            validation_data=(X_val, y_val),
-            epochs=50,
-            batch_size=hp["batch_size"],
-            shuffle=False,
-            callbacks=[early_stop],
-            verbose=1
-        )
-
-        best_val_loss = min(history.history['val_loss'])
-        fold_losses.append(best_val_loss)
-
-        del model
-        tf.keras.backend.clear_session()
-        gc.collect()
-
-    mean_loss = np.mean(fold_losses)
-    std_loss = np.std(fold_losses)
-    fitness = mean_loss + 0.2 * std_loss
+    # Strict memory cleanup to avoid C++ memory leak
+    del model
+    del history
+    tf.keras.backend.clear_session()
+    gc.collect()
 
     print(
         f"  [Eval] Filters={hp['n_filters']}, K={hp['kernel_size']}, "
         f"Window={hp['time_window']} (RF={hp['receptive_field']}), "
         f"Drop={hp['dropout']:.3f}, LR={hp['learning_rate']:.5f}, "
         f"Batch={hp['batch_size']}, WD={hp['weight_decay']:.5f} | "
-        f"ValLoss={mean_loss:.4f} (std={std_loss:.4f}) | Fitness={fitness:.4f}"
+        f"ValLoss={best_val_loss:.4f}"
     )
 
-    return fitness
+    return best_val_loss
 
 # ==========================================
 # 3. PSO CHECKPOINTING & BOUNDARIES
@@ -360,13 +361,13 @@ os.makedirs(SEED_CHECKPOINT_DIR, exist_ok=True)
 os.makedirs("output/plots", exist_ok=True)
 
 seed_list = [42, 43, 44, 45, 46]
-seed_models = []
+individual_predictions = []
 seed_histories = []
 seed_val_losses = []
 
 plt.figure(figsize=(10, 5))
 
-for seed in seed_list:
+for idx, seed in enumerate(seed_list):
     seed_model_path = os.path.join(SEED_CHECKPOINT_DIR, f"model_seed_{seed}.keras")
     seed_history_path = os.path.join(SEED_CHECKPOINT_DIR, f"history_seed_{seed}.pkl")
 
@@ -390,7 +391,7 @@ for seed in seed_list:
             dilations=best_hp.get("dilations", [1, 2, 4, 8, 16])
         )
 
-        early_stopping = ut.get_early_stopping(patience=40, monitor='val_loss')
+        early_stopping = ut.get_early_stopping(patience=40, monitor='val_loss', verbose=1)
 
         history_obj = model.fit(
             X_train_final,
@@ -408,12 +409,22 @@ for seed in seed_list:
         with open(seed_history_path, "wb") as f:
             pickle.dump(history, f)
 
-    seed_models.append(model)
+    # Immediately generate and store test probabilities, then delete model to free RAM
+    prob_pred = model.predict(X_test_final, verbose=0).ravel()
+    individual_predictions.append(prob_pred)
+    seed_metrics = ut.compute_classification_metrics(y_test_final, prob_pred)
+    print(f"Seed {seed}: Acc={seed_metrics['accuracy']*100:.2f}%, AUC={seed_metrics['auc']:.4f}, LogLoss={seed_metrics['log_loss']:.4f}")
+
     seed_histories.append(history)
     min_val_loss = min(history['val_loss'])
     seed_val_losses.append(min_val_loss)
     
     plt.plot(history['val_loss'], label=f"Seed {seed} Val (min={min_val_loss:.4f})")
+
+    # Free model and graph from RAM/VRAM
+    del model
+    tf.keras.backend.clear_session()
+    gc.collect()
 
 plt.title("TCN + Multi-Head Attention Multi-Seed Validation Loss")
 plt.xlabel("Epoch")
@@ -427,14 +438,6 @@ plt.close()
 # 6. ENSEMBLE AVERAGING & EVALUATION
 # ==========================================
 print("\n--- Generating Multi-Seed Ensemble Predictions ---")
-individual_predictions = []
-
-for idx, model in enumerate(seed_models):
-    prob_pred = model.predict(X_test_final, verbose=1).ravel()
-    individual_predictions.append(prob_pred)
-    seed_metrics = ut.compute_classification_metrics(y_test_final, prob_pred)
-    print(f"Seed {seed_list[idx]}: Acc={seed_metrics['accuracy']*100:.2f}%, AUC={seed_metrics['auc']:.4f}, LogLoss={seed_metrics['log_loss']:.4f}")
-
 # Compute Ensemble Average Probability: (1/K) * sum(p_k)
 ensemble_probabilities = np.mean(individual_predictions, axis=0)
 ensemble_metrics = ut.compute_classification_metrics(y_test_final, ensemble_probabilities)
