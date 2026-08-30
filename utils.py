@@ -34,6 +34,30 @@ def compute_receptive_field(k_size, dilations=(1, 2, 4, 8, 16), nb_stacks=1):
     """
     return 1 + 2 * (int(k_size) - 1) * int(nb_stacks) * sum(dilations)
 
+def get_focal_loss(gamma=2.0, alpha=0.25):
+    """
+    Returns Binary Focal Loss to prevent model collapse to the prior mean (0.5).
+    Down-weights easy examples and forces the network to focus on hard directional moves.
+    """
+    if hasattr(tf.keras.losses, 'BinaryFocalCrossentropy'):
+        return tf.keras.losses.BinaryFocalCrossentropy(
+            apply_class_balancing=True,
+            alpha=alpha,
+            gamma=gamma,
+            name='binary_focal_loss'
+        )
+
+    def focal_loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        bce = - (y_true * tf.math.log(y_pred) + (1.0 - y_true) * tf.math.log(1.0 - y_pred))
+        p_t = y_true * y_pred + (1.0 - y_true) * (1.0 - y_pred)
+        alpha_factor = y_true * alpha + (1.0 - y_true) * (1.0 - alpha)
+        modulating_factor = tf.math.pow(1.0 - p_t, gamma)
+        return tf.reduce_mean(alpha_factor * modulating_factor * bce)
+
+    return focal_loss
+
 def build_tcn_attention_model(
     input_shape,
     n_filters,
@@ -44,15 +68,15 @@ def build_tcn_attention_model(
     dilations=None
 ):
     """
-    Builds a TCN model with Multi-Head Attention, Layer Normalization,
-    and GlobalAveragePooling1D for binary directional classification.
+    Builds a TCN model with Multi-Head Attention, Dual Temporal Pooling
+    (last causal timestep + global average pool), and a 3-layer deep classification head.
     """
     if dilations is None:
         dilations = [1, 2, 4, 8, 16]
 
     inputs = layers.Input(shape=input_shape, name="input_sequence")
     
-    # 1. Temporal Convolutional Network with sequence output
+    # 1. Temporal Convolutional Network with causal padding and sequence output
     tcn_out = TCN(
         nb_filters=int(n_filters),
         kernel_size=int(k_size),
@@ -78,15 +102,25 @@ def build_tcn_attention_model(
     x = layers.Add(name="attn_residual")([tcn_out, attn_out])
     x = layers.LayerNormalization(name="layer_norm")(x)
 
-    # 3. Global Average Pooling (replaces deep dense stack to reduce overfitting)
-    x = layers.GlobalAveragePooling1D(name="global_avg_pool")(x)
+    # 3. Dual Temporal Pooling: Last-step (most recent causal state) + Global Avg Pooling
+    last_step = layers.Lambda(lambda t: t[:, -1, :], name="last_step_extraction")(x)
+    avg_pool = layers.GlobalAveragePooling1D(name="global_avg_pool")(x)
+    pooled = layers.Concatenate(name="dual_temporal_pooled")([last_step, avg_pool])
 
-    # 4. Classification Head
-    x = layers.Dense(32, activation='gelu', name="dense_projection")(x)
-    x = layers.Dropout(float(dropout), name="head_dropout")(x)
+    # 4. Three-Layer Deep Classification Head with BatchNorm, GELU, and Dropout
+    h = layers.Dense(128, activation='gelu', name="dense_head_1")(pooled)
+    h = layers.BatchNormalization(name="bn_1")(h)
+    h = layers.Dropout(float(dropout), name="dropout_1")(h)
+
+    h = layers.Dense(64, activation='gelu', name="dense_head_2")(h)
+    h = layers.BatchNormalization(name="bn_2")(h)
+    h = layers.Dropout(float(dropout), name="dropout_2")(h)
+
+    h = layers.Dense(32, activation='gelu', name="dense_head_3")(h)
+    h = layers.Dropout(float(dropout), name="dropout_3")(h)
 
     # 5. Output Layer: Probability of UP (1) vs DOWN (0)
-    outputs = layers.Dense(1, activation='sigmoid', name="direction_probability")(x)
+    outputs = layers.Dense(1, activation='sigmoid', name="direction_probability")(h)
 
     model = Model(inputs=inputs, outputs=outputs, name="PSO_TCN_Attention_Classifier")
 
@@ -96,9 +130,11 @@ def build_tcn_attention_model(
         weight_decay=float(weight_decay)
     )
 
+    loss_fn = get_focal_loss(gamma=2.0, alpha=0.25)
+
     model.compile(
         optimizer=optimizer,
-        loss=tf.keras.losses.BinaryCrossentropy(),
+        loss=loss_fn,
         metrics=[
             'accuracy',
             tf.keras.metrics.AUC(name='auc')
@@ -107,14 +143,28 @@ def build_tcn_attention_model(
 
     return model
 
-def get_early_stopping(patience=30, monitor='val_loss', verbose=0):
+def get_early_stopping(patience=25, monitor='val_auc', mode='max', verbose=0):
     """
-    Returns EarlyStopping callback with weight restoration.
+    Returns EarlyStopping callback with weight restoration based on AUC.
     """
     return EarlyStopping(
         monitor=monitor,
         patience=patience,
+        mode=mode,
         restore_best_weights=True,
+        verbose=verbose
+    )
+
+def get_reduce_lr(monitor='val_auc', factor=0.5, patience=10, min_lr=1e-6, mode='max', verbose=0):
+    """
+    Returns ReduceLROnPlateau callback to reduce learning rate when AUC plateaus.
+    """
+    return tf.keras.callbacks.ReduceLROnPlateau(
+        monitor=monitor,
+        factor=factor,
+        patience=patience,
+        min_lr=min_lr,
+        mode=mode,
         verbose=verbose
     )
 

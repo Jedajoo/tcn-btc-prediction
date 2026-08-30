@@ -147,7 +147,7 @@ all_prob_preds = []
 for seed in seed_list:
     seed_model_path = os.path.join(SEED_CHECKPOINT_DIR, f"model_seed_{seed}.keras")
     if os.path.exists(seed_model_path):
-        model = tf.keras.models.load_model(seed_model_path)
+        model = tf.keras.models.load_model(seed_model_path, compile=False)
         prob = model.predict(X_eval, verbose=0).ravel()
         all_prob_preds.append(prob)
         del model
@@ -155,7 +155,7 @@ for seed in seed_list:
 
 if len(all_prob_preds) == 0:
     print("Warning: No seed models found. Falling back to single model output/model/model_tcn_pso.keras")
-    model = tf.keras.models.load_model("output/model/model_tcn_pso.keras")
+    model = tf.keras.models.load_model("output/model/model_tcn_pso.keras", compile=False)
     all_prob_preds = [model.predict(X_eval, verbose=0).ravel()]
     del model
     tf.keras.backend.clear_session()

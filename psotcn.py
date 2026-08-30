@@ -204,20 +204,23 @@ def objective_function(params, precomputed_data, n_features):
         dilations=hp["dilations"]
     )
 
-    early_stop = ut.get_early_stopping(patience=15, monitor='val_loss', verbose=0)
+    early_stop = ut.get_early_stopping(patience=25, monitor='val_auc', mode='max', verbose=0)
+    reduce_lr = ut.get_reduce_lr(monitor='val_auc', factor=0.5, patience=10, mode='max', verbose=0)
 
     history = model.fit(
         X_tr,
         y_tr,
         validation_data=(X_val, y_val),
-        epochs=40,
+        epochs=200,
         batch_size=hp["batch_size"],
         shuffle=False,
-        callbacks=[early_stop],
-        verbose=0
+        callbacks=[early_stop, reduce_lr],
+        verbose=1
     )
 
-    best_val_loss = float(min(history.history['val_loss']))
+    best_val_auc = float(max(history.history.get('val_auc', [0.5])))
+    best_val_loss = float(min(history.history.get('val_loss', [0.693])))
+    fitness = float(1.0 - best_val_auc)
 
     # Strict memory cleanup to avoid C++ heap accumulation
     del model
@@ -230,10 +233,10 @@ def objective_function(params, precomputed_data, n_features):
         f"Window={hp['time_window']} (RF={hp['receptive_field']}), "
         f"Drop={hp['dropout']:.3f}, LR={hp['learning_rate']:.5f}, "
         f"Batch={hp['batch_size']}, WD={hp['weight_decay']:.5f} | "
-        f"ValLoss={best_val_loss:.4f}"
+        f"ValAUC={best_val_auc:.4f}, ValLoss={best_val_loss:.4f} | Fitness={fitness:.4f}"
     )
 
-    return best_val_loss
+    return fitness
 
 
 def run_pso_worker():
@@ -305,7 +308,7 @@ def run_pso_worker():
         if current_val < gbest_value:
             gbest_value = current_val
             gbest_position = particle['position'].copy()
-            print(f"  >>> New Global Best Loss: {gbest_value:.5f}")
+            print(f"  >>> New Global Best Fitness: {gbest_value:.5f} (Val AUC: {1.0 - gbest_value:.4f})")
 
         save_pso_checkpoint(iter_count, i, particles, gbest_position, gbest_value)
 
@@ -332,7 +335,7 @@ def run_pso_worker():
         print("\n==========================================")
         print("PSO OPTIMIZATION COMPLETED!")
         best_hp = decode_hyperparameters(gbest_position)
-        print(f"Best Fitness Value : {gbest_value:.5f}")
+        print(f"Best Fitness Value (1 - AUC) : {gbest_value:.5f} (AUC: {1.0 - gbest_value:.4f})")
         print("Optimal Hyperparameters:")
         for k, v in best_hp.items():
             if not k.startswith(('log_', 'k_', 'b_')):
@@ -397,7 +400,7 @@ def run_final_ensemble():
     seed_list = [42, 43, 44, 45, 46]
     individual_predictions = []
     seed_histories = []
-    seed_val_losses = []
+    seed_val_aucs = []
 
     plt.figure(figsize=(10, 5))
 
@@ -407,7 +410,7 @@ def run_final_ensemble():
 
         if os.path.exists(seed_model_path) and os.path.exists(seed_history_path):
             print(f"Loading existing trained model for Seed {seed}...")
-            model = tf.keras.models.load_model(seed_model_path)
+            model = tf.keras.models.load_model(seed_model_path, compile=False)
             with open(seed_history_path, "rb") as f:
                 history = pickle.load(f)
         else:
@@ -425,16 +428,17 @@ def run_final_ensemble():
                 dilations=best_hp.get("dilations", [1, 2, 4, 8, 16])
             )
 
-            early_stopping = ut.get_early_stopping(patience=40, monitor='val_loss', verbose=1)
+            early_stopping = ut.get_early_stopping(patience=40, monitor='val_auc', mode='max', verbose=1)
+            reduce_lr = ut.get_reduce_lr(monitor='val_auc', factor=0.5, patience=15, mode='max', verbose=0)
 
             history_obj = model.fit(
                 X_train_final,
                 y_train_final,
-                epochs=200,
+                epochs=600,
                 batch_size=best_hp["batch_size"],
                 validation_split=0.2,
                 shuffle=False,
-                callbacks=[early_stopping],
+                callbacks=[early_stopping, reduce_lr],
                 verbose=1
             )
 
@@ -450,18 +454,18 @@ def run_final_ensemble():
         print(f"Seed {seed}: Acc={seed_metrics['accuracy']*100:.2f}%, AUC={seed_metrics['auc']:.4f}, LogLoss={seed_metrics['log_loss']:.4f}")
 
         seed_histories.append(history)
-        min_val_loss = min(history['val_loss'])
-        seed_val_losses.append(min_val_loss)
+        max_val_auc = max(history.get('val_auc', [0.5]))
+        seed_val_aucs.append(max_val_auc)
 
-        plt.plot(history['val_loss'], label=f"Seed {seed} Val (min={min_val_loss:.4f})")
+        plt.plot(history.get('val_auc', []), label=f"Seed {seed} Val AUC (max={max_val_auc:.4f})")
 
         del model
         tf.keras.backend.clear_session()
         gc.collect()
 
-    plt.title("TCN + Multi-Head Attention Multi-Seed Validation Loss")
+    plt.title("TCN + Multi-Head Attention Multi-Seed Validation ROC-AUC")
     plt.xlabel("Epoch")
-    plt.ylabel("Binary Crossentropy Loss")
+    plt.ylabel("Validation ROC-AUC")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.savefig("output/plots/training_losses.png", dpi=300, bbox_inches='tight')
@@ -495,7 +499,7 @@ def run_final_ensemble():
         "ensemble_metrics": ensemble_metrics,
         "backtest_results": backtest_res,
         "best_hyperparameters": best_hp,
-        "seed_val_losses": seed_val_losses
+        "seed_val_aucs": seed_val_aucs
     }
     dump(evaluation_summary, "output/model/ensemble_evaluation.joblib")
 
