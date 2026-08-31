@@ -14,9 +14,9 @@ os.makedirs('output/model', exist_ok=True)
 os.makedirs('checkpoints/seeds', exist_ok=True)
 
 ticker = 'BTC-USD'
-start_date = '2022-01-01'
+start_date = '2020-01-01'
 end_date = '2026-01-01'
-time_window = 30  # Default sequence window
+time_window = 60  # Default sequence window
 
 print(f"Downloading historical data for {ticker} from {start_date} to {end_date}...")
 df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=False)

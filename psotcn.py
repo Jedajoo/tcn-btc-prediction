@@ -11,37 +11,33 @@ from joblib import dump, load
 
 # Global Constants & Hyperparameter Constraints
 ticker = "BTC-USD"
-ALLOWED_WINDOWS = [64, 128, 256]
-ALLOWED_KERNELS = [2, 3, 5]
+FIXED_TIME_WINDOW = 60
+FIXED_KERNEL_SIZE = 2
 FIXED_BATCH_SIZE = 32
 DEFAULT_DILATIONS = [1, 2, 4, 8, 16]
 
-# Build all valid pairs (k, w) where w >= receptive_field(k)
-VALID_KW_PAIRS = []
-for w in ALLOWED_WINDOWS:
-    for k in ALLOWED_KERNELS:
-        # Receptive field formula: 1 + 2 * (k - 1) * sum(dilations)
-        rf = 1 + 2 * (int(k) - 1) * 1 * sum(DEFAULT_DILATIONS)
-        if w >= rf:
-            VALID_KW_PAIRS.append({
-                "kernel_size": k,
-                "time_window": w,
-                "receptive_field": rf,
-                "dilations": DEFAULT_DILATIONS
-            })
+# Compute theoretical receptive field
+# Formula: 1 + 2 * (k - 1) * sum(dilations)
+RECEPTIVE_FIELD = 1 + 2 * (FIXED_KERNEL_SIZE - 1) * 1 * sum(DEFAULT_DILATIONS)
 
-# Boundaries for the 5 parameters:
+print(f"--- Fixed Configuration ---")
+print(f"  Kernel Size    : {FIXED_KERNEL_SIZE}")
+print(f"  Time Window    : {FIXED_TIME_WINDOW}")
+print(f"  Batch Size     : {FIXED_BATCH_SIZE}")
+print(f"  Dilations      : {DEFAULT_DILATIONS}")
+print(f"  Receptive Field: {RECEPTIVE_FIELD}")
+print(f"---------------------------")
+
+# Boundaries for the 4 search parameters:
 # [0] n_filters: [32, 256]
 # [1] dropout: [0.01, 0.40]
 # [2] log_lr: [-4.5, -2.5]
-# [3] kw_pair_idx: [0.0, len(VALID_KW_PAIRS) - 1e-4] (maps to valid (K, W) pairs)
-# [4] log_weight_decay: [-5.0, -2.0]
+# [3] log_weight_decay: [-5.0, -2.0]
 boundaries = [
-    (32, 256),
-    (0.01, 0.40),
-    (-4.5, -2.5),
-    (0.0, len(VALID_KW_PAIRS) - 1e-4),
-    (-5.0, -2.0)
+    (32, 256),     # [0] n_filters
+    (0.01, 0.40),  # [1] dropout
+    (-4.5, -2.5),  # [2] log_lr
+    (-5.0, -2.0)   # [3] log_weight_decay
 ]
 v_max = [(b[1] - b[0]) * 0.20 for b in boundaries]
 
@@ -85,7 +81,8 @@ def init_gpu():
 
 def decode_hyperparameters(p):
     """
-    Decodes continuous PSO particle position into concrete hyperparameters.
+    Decodes 4-dimensional continuous PSO particle position into concrete hyperparameters.
+    Fixed: kernel_size = 2, time_window = 60, batch_size = 32.
     """
     # 0. n_filters (multiple of 16 in [32, 256])
     n_filters = int(16 * round(p[0] / 16.0))
@@ -98,29 +95,20 @@ def decode_hyperparameters(p):
     log_lr = float(np.clip(p[2], -4.5, -2.5))
     learning_rate = 10.0 ** log_lr
 
-    # 3. Paired (kernel_size, time_window) search strictly satisfying window >= receptive_field
-    pair_idx = int(np.clip(np.floor(p[3]), 0, len(VALID_KW_PAIRS) - 1))
-    kw_pair = VALID_KW_PAIRS[pair_idx]
-    k_size = kw_pair["kernel_size"]
-    time_window = kw_pair["time_window"]
-    receptive_field = kw_pair["receptive_field"]
-    dilations = kw_pair["dilations"]
-
-    # 4. weight_decay
-    log_wd = float(np.clip(p[4], -5.0, -2.0))
+    # 3. weight_decay
+    log_wd = float(np.clip(p[3], -5.0, -2.0))
     weight_decay = 10.0 ** log_wd
 
     return {
         "n_filters": n_filters,
         "dropout": dropout,
         "learning_rate": learning_rate,
-        "kernel_size": k_size,
-        "time_window": time_window,
-        "receptive_field": receptive_field,
-        "dilations": dilations,
+        "kernel_size": FIXED_KERNEL_SIZE,
+        "time_window": FIXED_TIME_WINDOW,
+        "receptive_field": RECEPTIVE_FIELD,
+        "dilations": DEFAULT_DILATIONS,
         "batch_size": FIXED_BATCH_SIZE,
         "weight_decay": weight_decay,
-        "pair_idx": pair_idx,
         "log_lr": log_lr,
         "log_wd": log_wd
     }
@@ -164,18 +152,17 @@ def load_tabular_data():
 
 def precache_sequence_data(train_features, train_target):
     import utils as ut
-    precomputed = {}
-    for w in ALLOWED_WINDOWS:
-        X_all, y_all = ut.create_sequences(train_features, train_target, w)
-        val_size = max(1, int(len(X_all) * 0.20))
-        precomputed[w] = {
+    X_all, y_all = ut.create_sequences(train_features, train_target, FIXED_TIME_WINDOW)
+    val_size = max(1, int(len(X_all) * 0.20))
+    return {
+        FIXED_TIME_WINDOW: {
             "X_tr": X_all[:-val_size],
             "y_tr": y_all[:-val_size],
             "X_val": X_all[-val_size:],
             "y_val": y_all[-val_size:],
             "n_samples": len(X_all)
         }
-    return precomputed
+    }
 
 
 def objective_function(params, precomputed_data, n_features):
@@ -204,14 +191,14 @@ def objective_function(params, precomputed_data, n_features):
         dilations=hp["dilations"]
     )
 
-    early_stop = ut.get_early_stopping(patience=100, monitor='val_auc', mode='max', verbose=0)
+    early_stop = ut.get_early_stopping(patience=25, monitor='val_auc', mode='max', verbose=0)
     reduce_lr = ut.get_reduce_lr(monitor='val_auc', factor=0.5, patience=10, mode='max', verbose=0)
 
     history = model.fit(
         X_tr,
         y_tr,
         validation_data=(X_val, y_val),
-        epochs=200,
+        epochs=100,
         batch_size=hp["batch_size"],
         shuffle=False,
         callbacks=[early_stop, reduce_lr],
@@ -428,13 +415,13 @@ def run_final_ensemble():
                 dilations=best_hp.get("dilations", [1, 2, 4, 8, 16])
             )
 
-            early_stopping = ut.get_early_stopping(patience=200, monitor='val_auc', mode='max', verbose=1)
+            early_stopping = ut.get_early_stopping(patience=40, monitor='val_auc', mode='max', verbose=1)
             reduce_lr = ut.get_reduce_lr(monitor='val_auc', factor=0.5, patience=15, mode='max', verbose=0)
 
             history_obj = model.fit(
                 X_train_final,
                 y_train_final,
-                epochs=600,
+                epochs=250,
                 batch_size=best_hp["batch_size"],
                 validation_split=0.2,
                 shuffle=False,
