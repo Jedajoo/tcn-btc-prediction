@@ -204,7 +204,7 @@ def objective_function(params, precomputed_data, n_features):
         dilations=hp["dilations"]
     )
 
-    early_stop = ut.get_early_stopping(patience=25, monitor='val_auc', mode='max', verbose=0)
+    early_stop = ut.get_early_stopping(patience=100, monitor='val_auc', mode='max', verbose=0)
     reduce_lr = ut.get_reduce_lr(monitor='val_auc', factor=0.5, patience=10, mode='max', verbose=0)
 
     history = model.fit(
@@ -428,7 +428,7 @@ def run_final_ensemble():
                 dilations=best_hp.get("dilations", [1, 2, 4, 8, 16])
             )
 
-            early_stopping = ut.get_early_stopping(patience=40, monitor='val_auc', mode='max', verbose=1)
+            early_stopping = ut.get_early_stopping(patience=200, monitor='val_auc', mode='max', verbose=1)
             reduce_lr = ut.get_reduce_lr(monitor='val_auc', factor=0.5, patience=15, mode='max', verbose=0)
 
             history_obj = model.fit(
