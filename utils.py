@@ -34,14 +34,15 @@ def compute_receptive_field(k_size, dilations=(1, 2, 4, 8, 16), nb_stacks=1):
     """
     return 1 + 2 * (int(k_size) - 1) * int(nb_stacks) * sum(dilations)
 
-def get_focal_loss(gamma=2.0, alpha=0.25):
+def get_focal_loss(gamma=2.0, alpha=0.50):
     """
-    Returns Binary Focal Loss to prevent model collapse to the prior mean (0.5).
+    Returns Symmetric Binary Focal Loss to prevent model collapse.
     Down-weights easy examples and forces the network to focus on hard directional moves.
+    With alpha=0.50, both UP and DOWN are penalized with equal balance.
     """
     if hasattr(tf.keras.losses, 'BinaryFocalCrossentropy'):
         return tf.keras.losses.BinaryFocalCrossentropy(
-            apply_class_balancing=True,
+            apply_class_balancing=False,
             alpha=alpha,
             gamma=gamma,
             name='binary_focal_loss'
@@ -57,6 +58,23 @@ def get_focal_loss(gamma=2.0, alpha=0.25):
         return tf.reduce_mean(alpha_factor * modulating_factor * bce)
 
     return focal_loss
+
+def find_optimal_threshold(y_true, y_prob):
+    """
+    Finds the optimal classification threshold using Youden's J-statistic on the ROC curve.
+    J = TPR - FPR = Sensitivity + Specificity - 1
+    """
+    from sklearn.metrics import roc_curve
+    y_true = np.asarray(y_true).ravel()
+    y_prob = np.asarray(y_prob).ravel()
+    if len(np.unique(y_true)) < 2:
+        return 0.50
+    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+    j_scores = tpr - fpr
+    optimal_idx = np.argmax(j_scores)
+    optimal_thresh = float(thresholds[optimal_idx])
+    # Safeguard within reasonable financial probability range [0.35, 0.65]
+    return float(np.clip(optimal_thresh, 0.35, 0.65))
 
 def build_tcn_attention_model(
     input_shape,
@@ -130,7 +148,7 @@ def build_tcn_attention_model(
         weight_decay=float(weight_decay)
     )
 
-    loss_fn = get_focal_loss(gamma=2.0, alpha=0.25)
+    loss_fn = get_focal_loss(gamma=2.0, alpha=0.50)
 
     model.compile(
         optimizer=optimizer,

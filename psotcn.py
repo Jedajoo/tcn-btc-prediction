@@ -35,7 +35,7 @@ print(f"---------------------------")
 # [3] log_weight_decay: [-5.0, -2.0]
 boundaries = [
     (32, 256),     # [0] n_filters
-    (0.01, 0.40),  # [1] dropout
+    (0.001, 0.1),  # [1] dropout
     (-4.5, -2.5),  # [2] log_lr
     (-5.0, -2.0)   # [3] log_weight_decay
 ]
@@ -372,6 +372,9 @@ def run_final_ensemble():
 
     best_window = best_hp["time_window"]
     X_train_final, y_train_final = ut.create_sequences(train_features, train_target, best_window)
+    val_size = max(1, int(len(X_train_final) * 0.20))
+    X_tr_final, y_tr_final = X_train_final[:-val_size], y_train_final[:-val_size]
+    X_val_final, y_val_final = X_train_final[-val_size:], y_train_final[-val_size:]
 
     # Build test sequences with lookback buffer
     test_input_features = np.vstack([
@@ -386,6 +389,7 @@ def run_final_ensemble():
 
     seed_list = [42, 43, 44, 45, 46]
     individual_predictions = []
+    val_individual_predictions = []
     seed_histories = []
     seed_val_aucs = []
 
@@ -415,15 +419,15 @@ def run_final_ensemble():
                 dilations=best_hp.get("dilations", [1, 2, 4, 8, 16])
             )
 
-            early_stopping = ut.get_early_stopping(patience=40, monitor='val_auc', mode='max', verbose=1)
-            reduce_lr = ut.get_reduce_lr(monitor='val_auc', factor=0.5, patience=15, mode='max', verbose=0)
+            early_stopping = ut.get_early_stopping(patience=20, monitor='val_auc', mode='max', verbose=1)
+            reduce_lr = ut.get_reduce_lr(monitor='val_auc', factor=0.5, patience=10, mode='max', verbose=0)
 
             history_obj = model.fit(
-                X_train_final,
-                y_train_final,
-                epochs=250,
+                X_tr_final,
+                y_tr_final,
+                validation_data=(X_val_final, y_val_final),
+                epochs=100,
                 batch_size=best_hp["batch_size"],
-                validation_split=0.2,
                 shuffle=False,
                 callbacks=[early_stopping, reduce_lr],
                 verbose=1
@@ -434,9 +438,13 @@ def run_final_ensemble():
             with open(seed_history_path, "wb") as f:
                 pickle.dump(history, f)
 
-        # Immediately predict on test set and free model memory
+        # Predict on validation and test sets
+        val_prob = model.predict(X_val_final, verbose=0).ravel()
+        val_individual_predictions.append(val_prob)
+
         prob_pred = model.predict(X_test_final, verbose=0).ravel()
         individual_predictions.append(prob_pred)
+
         seed_metrics = ut.compute_classification_metrics(y_test_final, prob_pred)
         print(f"Seed {seed}: Acc={seed_metrics['accuracy']*100:.2f}%, AUC={seed_metrics['auc']:.4f}, LogLoss={seed_metrics['log_loss']:.4f}")
 
@@ -458,37 +466,46 @@ def run_final_ensemble():
     plt.savefig("output/plots/training_losses.png", dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 6. Ensemble Evaluation
+    # 6. Ensemble Evaluation & Validation-based Threshold Calibration
     print("\n--- Generating Multi-Seed Ensemble Predictions ---")
+    val_ensemble_probs = np.mean(val_individual_predictions, axis=0)
+    optimal_threshold = ut.find_optimal_threshold(y_val_final, val_ensemble_probs)
+    print(f"Calibrated Optimal Decision Threshold (Youden's J on Validation): {optimal_threshold:.4f}")
+
     ensemble_probabilities = np.mean(individual_predictions, axis=0)
-    ensemble_metrics = ut.compute_classification_metrics(y_test_final, ensemble_probabilities)
+    ensemble_metrics = ut.compute_classification_metrics(y_test_final, ensemble_probabilities, threshold=optimal_threshold)
+    std_ensemble_metrics = ut.compute_classification_metrics(y_test_final, ensemble_probabilities, threshold=0.50)
 
     test_eval_returns = test_returns[-len(y_test_final):]
     test_eval_prices = test_prices[-len(y_test_final):]
-    backtest_res = ut.backtest_directional_strategy(test_eval_returns, ensemble_probabilities)
+    backtest_res = ut.backtest_directional_strategy(test_eval_returns, ensemble_probabilities, threshold=optimal_threshold)
 
     print("\n==========================================")
-    print("FINAL ENSEMBLE TEST PERFORMANCE")
+    print("FINAL ENSEMBLE TEST PERFORMANCE (CALIBRATED THRESHOLD)")
     print("==========================================")
-    print(f"Ensemble Accuracy       : {ensemble_metrics['accuracy']*100:.2f}%")
+    print(f"Optimal Decision Thresh : {optimal_threshold:.4f} (vs standard 0.50)")
+    print(f"Ensemble Accuracy (Cal) : {ensemble_metrics['accuracy']*100:.2f}% (Standard 0.5: {std_ensemble_metrics['accuracy']*100:.2f}%)")
     print(f"Ensemble ROC-AUC Score  : {ensemble_metrics['auc']:.4f}")
     print(f"Ensemble Precision      : {ensemble_metrics['precision']*100:.2f}%")
     print(f"Ensemble Recall         : {ensemble_metrics['recall']*100:.2f}%")
     print(f"Ensemble F1-Score       : {ensemble_metrics['f1']:.4f}")
     print(f"Brier Score (Calibration): {ensemble_metrics['brier_score']:.4f}")
     print(f"Mean Prediction Certainty: {ensemble_metrics['confidence_mean']:.2f}%")
-    print(f"High-Confidence Accuracy: {ensemble_metrics['high_conf_acc']*100:.2f}% (Coverage: {ensemble_metrics['high_conf_coverage']:.1f}%)")
     print(f"Strategy Cumulative Ret : {backtest_res['total_strategy_return']:.2f}% (vs Market Buy&Hold: {backtest_res['total_market_return']:.2f}%)")
     print(f"Strategy Sharpe Ratio   : {backtest_res['sharpe_ratio']:.2f}")
     print("==========================================\n")
 
+    best_hp["optimal_threshold"] = optimal_threshold
     evaluation_summary = {
         "ensemble_metrics": ensemble_metrics,
+        "std_ensemble_metrics": std_ensemble_metrics,
+        "optimal_threshold": optimal_threshold,
         "backtest_results": backtest_res,
         "best_hyperparameters": best_hp,
         "seed_val_aucs": seed_val_aucs
     }
     dump(evaluation_summary, "output/model/ensemble_evaluation.joblib")
+    dump(best_hp, "output/model/best_hyperparameters.joblib")
 
     # 7. Generate Plots
     # A. ROC Curve
@@ -509,15 +526,16 @@ def run_final_ensemble():
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Down (0)', 'Up (1)'])
     fig, ax = plt.subplots(figsize=(6, 5))
     disp.plot(ax=ax, cmap='Blues', values_format='d')
-    plt.title('Directional Movement Confusion Matrix')
+    plt.title(f'Confusion Matrix (Threshold = {optimal_threshold:.3f})')
     plt.savefig('output/plots/confusion_matrix.png', dpi=300, bbox_inches='tight')
     plt.close()
 
     # C. Probability & Confidence Distribution
-    confidences = np.abs(ensemble_probabilities - 0.5) * 2.0 * 100.0
+    confidences = np.abs(ensemble_probabilities - optimal_threshold) * 2.0 * 100.0
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     ax1.hist(ensemble_probabilities, bins=25, color='teal', edgecolor='black', alpha=0.7)
-    ax1.axvline(0.5, color='red', linestyle='--', label='Decision Threshold (0.5)')
+    ax1.axvline(optimal_threshold, color='red', linestyle='--', label=f'Optimal Threshold ({optimal_threshold:.3f})')
+    ax1.axvline(0.50, color='gray', linestyle=':', label='Default (0.50)')
     ax1.set_title('Predicted Probability Distribution P(Up)')
     ax1.set_xlabel('Probability P(Up)')
     ax1.set_ylabel('Frequency')
@@ -537,10 +555,10 @@ def run_final_ensemble():
     plt.figure(figsize=(14, 7))
     ax_top = plt.subplot(2, 1, 1)
     ax_top.plot(test_eval_prices, label=f'{ticker} Actual Close Price', color='black', alpha=0.8)
-    up_signals = np.where(ensemble_probabilities >= 0.5)[0]
-    down_signals = np.where(ensemble_probabilities < 0.5)[0]
-    ax_top.scatter(up_signals, test_eval_prices[up_signals], color='green', marker='^', s=25, label='Signal UP (P >= 0.5)', alpha=0.7)
-    ax_top.scatter(down_signals, test_eval_prices[down_signals], color='red', marker='v', s=25, label='Signal DOWN (P < 0.5)', alpha=0.7)
+    up_signals = np.where(ensemble_probabilities >= optimal_threshold)[0]
+    down_signals = np.where(ensemble_probabilities < optimal_threshold)[0]
+    ax_top.scatter(up_signals, test_eval_prices[up_signals], color='green', marker='^', s=25, label=f'Signal UP (P >= {optimal_threshold:.2f})', alpha=0.7)
+    ax_top.scatter(down_signals, test_eval_prices[down_signals], color='red', marker='v', s=25, label=f'Signal DOWN (P < {optimal_threshold:.2f})', alpha=0.7)
     ax_top.set_title(f'Ensemble Model Directional Signals vs {ticker} Price')
     ax_top.legend(loc='upper left')
     ax_top.grid(True, alpha=0.3)

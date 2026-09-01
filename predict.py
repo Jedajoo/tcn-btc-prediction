@@ -38,7 +38,7 @@ elif 'Close' in df.columns and 'Adj Close' not in df.columns:
 df = df[df['Volume'] > 0].dropna()
 
 # ==========================================
-# 1. FEATURE EXTRACTION
+# 1. TECHNICAL INDICATORS & STATIONARY FEATURE ENGINEERING
 # ==========================================
 close_s = df['Adj Close'].squeeze()
 high_s = df['High'].squeeze()
@@ -46,41 +46,58 @@ low_s = df['Low'].squeeze()
 open_s = df['Open'].squeeze()
 vol_s = df['Volume'].squeeze()
 
-# Technical Indicators
-df['SMA10'] = close_s.rolling(10, min_periods=1).mean()
-df['SMA25'] = close_s.rolling(25, min_periods=1).mean()
+# A. Stationary Price & Return Ratios
+df['Log_Return_1'] = np.log(close_s / (close_s.shift(1) + 1e-9)).fillna(0.0)
+df['Log_Return_3'] = np.log(close_s / (close_s.shift(3) + 1e-9)).fillna(0.0)
+df['Log_Return_5'] = np.log(close_s / (close_s.shift(5) + 1e-9)).fillna(0.0)
+df['Log_Return_10'] = np.log(close_s / (close_s.shift(10) + 1e-9)).fillna(0.0)
+df['High_Low_Ratio'] = ((high_s - low_s) / (close_s + 1e-9)).fillna(0.0)
+df['Close_Open_Ratio'] = ((close_s - open_s) / (open_s + 1e-9)).fillna(0.0)
 
+# B. Moving Averages Ratios (Distance from SMA)
+sma10 = close_s.rolling(10, min_periods=1).mean()
+sma25 = close_s.rolling(25, min_periods=1).mean()
+df['Dist_SMA10'] = ((close_s - sma10) / (sma10 + 1e-9)).fillna(0.0)
+df['Dist_SMA25'] = ((close_s - sma25) / (sma25 + 1e-9)).fillna(0.0)
+
+# C. Normalized MACD
 ema_12 = close_s.ewm(span=12, min_periods=1).mean()
 ema_26 = close_s.ewm(span=26, min_periods=1).mean()
-df['MACD Line'] = ema_12 - ema_26
-df['MACD Signal'] = df['MACD Line'].ewm(span=9, min_periods=1).mean()
-df['MACD Hist'] = df['MACD Line'] - df['MACD Signal']
+macd_line = ema_12 - ema_26
+macd_signal = macd_line.ewm(span=9, min_periods=1).mean()
+macd_hist = macd_line - macd_signal
+df['MACD_Line_Norm'] = (macd_line / (close_s + 1e-9)).fillna(0.0)
+df['MACD_Signal_Norm'] = (macd_signal / (close_s + 1e-9)).fillna(0.0)
+df['MACD_Hist_Norm'] = (macd_hist / (close_s + 1e-9)).fillna(0.0)
 
+# D. RSI (14) Normalized to [-1.0, 1.0]
 delta = close_s.diff()
 gain = delta.where(delta > 0, 0.0)
 loss = -delta.where(delta < 0, 0.0)
 avg_gain = gain.ewm(alpha=1/14, min_periods=1).mean()
 avg_loss = loss.ewm(alpha=1/14, min_periods=1).mean()
 rs = avg_gain / (avg_loss + 1e-9)
-df['RSI'] = 100.0 - (100.0 / (1.0 + rs))
-df['RSI'] = df['RSI'].replace([np.inf, -np.inf], np.nan).ffill().bfill()
+rsi = 100.0 - (100.0 / (1.0 + rs))
+rsi = rsi.replace([np.inf, -np.inf], np.nan).ffill().bfill()
+df['RSI_Norm'] = (rsi - 50.0) / 50.0
 
+# E. Bollinger Bands Normalized
 std_dev = close_s.rolling(20, min_periods=1).std(ddof=0).fillna(0)
 m_band = close_s.rolling(20, min_periods=1).mean()
-df['Upper BBand'] = m_band + 2 * std_dev
-df['Lower BBand'] = m_band - 2 * std_dev
-df['Band Width'] = df['Upper BBand'] - df['Lower BBand']
-df['Band %'] = (close_s - df['Lower BBand']) / (df['Band Width'] + 1e-9)
-df[['Band Width', 'Band %']] = df[['Band Width', 'Band %']].replace([np.inf, -np.inf], np.nan).ffill().bfill()
+upper_bband = m_band + 2 * std_dev
+lower_bband = m_band - 2 * std_dev
+band_width = upper_bband - lower_bband
+df['Band_Pos'] = ((close_s - lower_bband) / (band_width + 1e-9)).clip(-1.0, 2.0).fillna(0.5)
+df['Band_Width_Norm'] = (band_width / (close_s + 1e-9)).fillna(0.0)
 
-# Garman-Klass Volatility
+# F. Garman-Klass Volatility
 log_hl = np.log(np.maximum(high_s / (low_s + 1e-9), 1e-9))
 log_co = np.log(np.maximum(close_s / (open_s + 1e-9), 1e-9))
 gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
 df['GK_Vol'] = np.sqrt(np.maximum(gk_var, 0.0))
 df['GK_Vol_14'] = df['GK_Vol'].rolling(14, min_periods=1).mean()
 
-# Chaikin Money Flow (CMF 20)
+# G. Chaikin Money Flow (CMF 20)
 hl_diff = (high_s - low_s).replace(0, np.nan)
 mf_multiplier = ((close_s - low_s) - (high_s - close_s)) / (hl_diff + 1e-9)
 mf_multiplier = mf_multiplier.fillna(0.0)
@@ -88,15 +105,22 @@ mf_volume = mf_multiplier * vol_s
 df['CMF'] = mf_volume.rolling(20, min_periods=1).sum() / (vol_s.rolling(20, min_periods=1).sum() + 1e-9)
 df['CMF'] = df['CMF'].replace([np.inf, -np.inf], np.nan).ffill().bfill()
 
-# Stochastic Oscillator (%K, %D 14, 3)
+# H. Stochastic Oscillator Normalized to [-1.0, 1.0]
 lowest_low_14 = low_s.rolling(14, min_periods=1).min()
 highest_high_14 = high_s.rolling(14, min_periods=1).max()
 stoch_range = (highest_high_14 - lowest_low_14).replace(0, np.nan)
-df['Stoch_K'] = ((close_s - lowest_low_14) / (stoch_range + 1e-9)) * 100.0
-df['Stoch_K'] = df['Stoch_K'].replace([np.inf, -np.inf], np.nan).ffill().bfill()
-df['Stoch_D'] = df['Stoch_K'].rolling(3, min_periods=1).mean().ffill().bfill()
+stoch_k = ((close_s - lowest_low_14) / (stoch_range + 1e-9)) * 100.0
+stoch_k = stoch_k.replace([np.inf, -np.inf], np.nan).ffill().bfill()
+stoch_d = stoch_k.rolling(3, min_periods=1).mean().ffill().bfill()
+df['Stoch_K_Norm'] = (stoch_k - 50.0) / 50.0
+df['Stoch_D_Norm'] = (stoch_d - 50.0) / 50.0
 
-# Calendar Cyclical Features
+# I. Volume Relative Metrics
+vol_sma20 = vol_s.rolling(20, min_periods=1).mean()
+df['Volume_Pct_Change'] = (vol_s.pct_change()).clip(-2.0, 5.0).fillna(0.0)
+df['Volume_SMA_Ratio'] = ((vol_s / (vol_sma20 + 1e-9)) - 1.0).clip(-2.0, 5.0).fillna(0.0)
+
+# J. Calendar / Cyclical Features
 day_of_week = df.index.dayofweek
 day_of_month = df.index.day
 month = df.index.month
@@ -111,7 +135,7 @@ df['Is_Weekend'] = (day_of_week >= 5).astype(float)
 
 # Next day target
 df['Next_Adj_Close'] = close_s.shift(-1)
-df['Next_Return'] = (df['Next_Adj_Close'] - close_s) / close_s
+df['Next_Return'] = (df['Next_Adj_Close'] - close_s) / (close_s + 1e-9)
 df['Target_Direction'] = (df['Next_Adj_Close'] > close_s).astype(int)
 
 df = df.dropna()
@@ -122,12 +146,14 @@ df = df.dropna()
 scaler = load("output/scaler/feature_scaler.joblib")
 feature_cols = load("output/scaler/feature_columns.joblib")
 
-# Load best hyperparameters to get time_window
+# Load best hyperparameters to get time_window and calibrated threshold
+optimal_thresh = 0.50
 if os.path.exists("output/model/best_hyperparameters.joblib"):
     best_hp = load("output/model/best_hyperparameters.joblib")
-    time_window = best_hp["time_window"]
+    time_window = best_hp.get("time_window", 60)
+    optimal_thresh = float(best_hp.get("optimal_threshold", 0.50))
 else:
-    time_window = 30
+    time_window = 60
 
 scaled_features = scaler.transform(df[feature_cols])
 
@@ -162,8 +188,8 @@ if len(all_prob_preds) == 0:
 
 print(f"Running inference with {len(all_prob_preds)} ensemble prediction(s)...")
 ensemble_probs = np.mean(all_prob_preds, axis=0)
-pred_directions = (ensemble_probs >= 0.5).astype(int)
-confidences = np.abs(ensemble_probs - 0.5) * 2.0 * 100.0
+pred_directions = (ensemble_probs >= optimal_thresh).astype(int)
+confidences = np.abs(ensemble_probs - optimal_thresh) * 2.0 * 100.0
 
 # ==========================================
 # 4. RESULTS SUMMARY & EVALUATION
@@ -180,7 +206,7 @@ results_df = pd.DataFrame({
     'Correct': np.where(pred_directions == y_eval, '✓', '✗')
 })
 
-print("\n--- Recent Directional Predictions (Last 15 Days) ---")
+print(f"\n--- Recent Directional Predictions (Threshold = {optimal_thresh:.3f}) ---")
 print(results_df.tail(15).to_string(index=False))
 
 # Evaluation Metrics
@@ -191,11 +217,12 @@ rec = recall_score(y_eval, pred_directions, zero_division=0)
 f1 = f1_score(y_eval, pred_directions, zero_division=0)
 
 print("\n--- Model Evaluation Summary ---")
-print(f"Accuracy : {acc * 100:.2f}%")
-print(f"ROC-AUC  : {auc_val:.4f}")
-print(f"Precision: {prec * 100:.2f}%")
-print(f"Recall   : {rec * 100:.2f}%")
-print(f"F1-Score : {f1:.4f}")
+print(f"Decision Thresh : {optimal_thresh:.4f}")
+print(f"Accuracy        : {acc * 100:.2f}%")
+print(f"ROC-AUC         : {auc_val:.4f}")
+print(f"Precision       : {prec * 100:.2f}%")
+print(f"Recall          : {rec * 100:.2f}%")
+print(f"F1-Score        : {f1:.4f}")
 
 # Latest Prediction Forecast
 latest_row = results_df.iloc[-1]
@@ -218,8 +245,8 @@ ax1 = plt.subplot(2, 1, 1)
 ax1.plot(eval_dates, eval_prices, label=f'{ticker} Price', color='black', alpha=0.7)
 up_idx = np.where(pred_directions == 1)[0]
 down_idx = np.where(pred_directions == 0)[0]
-ax1.scatter(eval_dates[up_idx], eval_prices[up_idx], color='green', marker='^', s=30, label='Predicted UP', alpha=0.6)
-ax1.scatter(eval_dates[down_idx], eval_prices[down_idx], color='red', marker='v', s=30, label='Predicted DOWN', alpha=0.6)
+ax1.scatter(eval_dates[up_idx], eval_prices[up_idx], color='green', marker='^', s=30, label=f'Predicted UP (P >= {optimal_thresh:.2f})', alpha=0.6)
+ax1.scatter(eval_dates[down_idx], eval_prices[down_idx], color='red', marker='v', s=30, label=f'Predicted DOWN (P < {optimal_thresh:.2f})', alpha=0.6)
 ax1.set_title(f'{ticker} Directional Predictions (PSO-TCN Ensemble)')
 ax1.legend(loc='upper left')
 ax1.grid(True, alpha=0.3)
@@ -227,10 +254,10 @@ ax1.grid(True, alpha=0.3)
 # Subplot 2: Confidence and Probability
 ax2 = plt.subplot(2, 1, 2)
 ax2.plot(eval_dates, ensemble_probs * 100.0, label='Probability of UP (%)', color='teal', lw=1.5)
-ax2.axhline(50.0, color='red', linestyle='--', label='50% Threshold')
-ax2.fill_between(eval_dates, 50.0, ensemble_probs * 100.0, where=(ensemble_probs >= 0.5), color='green', alpha=0.15)
-ax2.fill_between(eval_dates, 50.0, ensemble_probs * 100.0, where=(ensemble_probs < 0.5), color='red', alpha=0.15)
-ax2.set_title('Prediction Probability P(UP) & Confidence Margin')
+ax2.axhline(optimal_thresh * 100.0, color='red', linestyle='--', label=f'Threshold ({optimal_thresh*100:.1f}%)')
+ax2.fill_between(eval_dates, optimal_thresh * 100.0, ensemble_probs * 100.0, where=(ensemble_probs >= optimal_thresh), color='green', alpha=0.15)
+ax2.fill_between(eval_dates, optimal_thresh * 100.0, ensemble_probs * 100.0, where=(ensemble_probs < optimal_thresh), color='red', alpha=0.15)
+ax2.set_title('Prediction Probability P(UP) & Calibrated Decision Boundary')
 ax2.set_xlabel('Date')
 ax2.set_ylabel('Probability (%)')
 ax2.legend(loc='upper left')
