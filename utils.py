@@ -27,29 +27,24 @@ def create_sequences(features, target, window):
         y.append(target[i + window - 1])
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
-def compute_receptive_field(k_size, dilations=(1, 2, 4, 8, 16), nb_stacks=1):
+def compute_receptive_field(k_size, dilations=(1, 2, 4, 8, 16, 32), nb_stacks=1):
     """
     Computes theoretical receptive field for a 1D causal TCN:
     RF = 1 + 2 * (k - 1) * nb_stacks * sum(dilations)
     """
     return 1 + 2 * (int(k_size) - 1) * int(nb_stacks) * sum(dilations)
 
-def get_focal_loss(gamma=2.0, alpha=0.50):
+def get_focal_loss(gamma=2.0, alpha=0.50, label_smoothing=0.05):
     """
-    Returns Symmetric Binary Focal Loss to prevent model collapse.
-    Down-weights easy examples and forces the network to focus on hard directional moves.
-    With alpha=0.50, both UP and DOWN are penalized with equal balance.
+    Returns Symmetric Binary Focal Loss with Label Smoothing.
+    - Down-weights easy examples and forces the network to focus on hard directional moves.
+    - Label smoothing (0.05) prevents over-fitting to noisy financial targets.
+    - Symmetric alpha=0.50 ensures equal penalization of UP and DOWN errors.
     """
-    if hasattr(tf.keras.losses, 'BinaryFocalCrossentropy'):
-        return tf.keras.losses.BinaryFocalCrossentropy(
-            apply_class_balancing=False,
-            alpha=alpha,
-            gamma=gamma,
-            name='binary_focal_loss'
-        )
-
     def focal_loss(y_true, y_pred):
         y_true = tf.cast(y_true, tf.float32)
+        if label_smoothing > 0.0:
+            y_true = y_true * (1.0 - 2.0 * label_smoothing) + label_smoothing
         y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
         bce = - (y_true * tf.math.log(y_pred) + (1.0 - y_true) * tf.math.log(1.0 - y_pred))
         p_t = y_true * y_pred + (1.0 - y_true) * (1.0 - y_pred)
@@ -90,7 +85,7 @@ def build_tcn_attention_model(
     (last causal timestep + global average pool), and a 3-layer deep classification head.
     """
     if dilations is None:
-        dilations = [1, 2, 4, 8, 16]
+        dilations = [1, 2, 4, 8, 16, 32]
 
     inputs = layers.Input(shape=input_shape, name="input_sequence")
     
@@ -148,7 +143,7 @@ def build_tcn_attention_model(
         weight_decay=float(weight_decay)
     )
 
-    loss_fn = get_focal_loss(gamma=2.0, alpha=0.50)
+    loss_fn = get_focal_loss(gamma=2.0, alpha=0.50, label_smoothing=0.05)
 
     model.compile(
         optimizer=optimizer,
@@ -209,11 +204,11 @@ def compute_classification_metrics(y_true, y_prob, threshold=0.5):
     loss = log_loss(y_true, np.clip(y_prob, 1e-7, 1 - 1e-7))
     cm = confusion_matrix(y_true, y_pred)
 
-    # Confidence calculation: distance from decision boundary (0.5)
-    confidence = np.abs(y_prob - 0.5) * 2.0  # Range [0.0, 1.0]
+    # Confidence calculation: distance from calibrated decision boundary
+    confidence = np.abs(y_prob - threshold) * 2.0  # Range [0.0, 1.0]
     
-    # High confidence subset metrics (> 0.60 certainty)
-    high_conf_mask = confidence >= 0.20  # prob >= 0.60 or <= 0.40
+    # High confidence subset metrics (conviction margin >= 0.04 from decision boundary)
+    high_conf_mask = np.abs(y_prob - threshold) >= 0.04
     if np.sum(high_conf_mask) > 0:
         high_conf_acc = accuracy_score(y_true[high_conf_mask], y_pred[high_conf_mask])
         high_conf_coverage = np.mean(high_conf_mask) * 100.0

@@ -11,10 +11,10 @@ from joblib import dump, load
 
 # Global Constants & Hyperparameter Constraints
 ticker = "BTC-USD"
-FIXED_TIME_WINDOW = 60
+FIXED_TIME_WINDOW = 90
 FIXED_KERNEL_SIZE = 2
 FIXED_BATCH_SIZE = 32
-DEFAULT_DILATIONS = [1, 2, 4, 8, 16]
+DEFAULT_DILATIONS = [1, 2, 4, 8, 16, 32]
 
 # Compute theoretical receptive field
 # Formula: 1 + 2 * (k - 1) * sum(dilations)
@@ -22,7 +22,7 @@ RECEPTIVE_FIELD = 1 + 2 * (FIXED_KERNEL_SIZE - 1) * 1 * sum(DEFAULT_DILATIONS)
 
 print(f"--- Fixed Configuration ---")
 print(f"  Kernel Size    : {FIXED_KERNEL_SIZE}")
-print(f"  Time Window    : {FIXED_TIME_WINDOW}")
+print(f"  Time Window    : {FIXED_TIME_WINDOW} days (3 Months)")
 print(f"  Batch Size     : {FIXED_BATCH_SIZE}")
 print(f"  Dilations      : {DEFAULT_DILATIONS}")
 print(f"  Receptive Field: {RECEPTIVE_FIELD}")
@@ -30,12 +30,12 @@ print(f"---------------------------")
 
 # Boundaries for the 4 search parameters:
 # [0] n_filters: [32, 256]
-# [1] dropout: [0.01, 0.40]
+# [1] dropout: [0.05, 0.35]
 # [2] log_lr: [-4.5, -2.5]
 # [3] log_weight_decay: [-5.0, -2.0]
 boundaries = [
     (32, 256),     # [0] n_filters
-    (0.001, 0.1),  # [1] dropout
+    (0.05, 0.35),  # [1] dropout
     (-4.5, -2.5),  # [2] log_lr
     (-5.0, -2.0)   # [3] log_weight_decay
 ]
@@ -491,6 +491,7 @@ def run_final_ensemble():
     print(f"Ensemble F1-Score       : {ensemble_metrics['f1']:.4f}")
     print(f"Brier Score (Calibration): {ensemble_metrics['brier_score']:.4f}")
     print(f"Mean Prediction Certainty: {ensemble_metrics['confidence_mean']:.2f}%")
+    print(f"High-Confidence Accuracy: {ensemble_metrics['high_conf_acc']*100:.2f}% (Coverage: {ensemble_metrics['high_conf_coverage']:.1f}%)")
     print(f"Strategy Cumulative Ret : {backtest_res['total_strategy_return']:.2f}% (vs Market Buy&Hold: {backtest_res['total_market_return']:.2f}%)")
     print(f"Strategy Sharpe Ratio   : {backtest_res['sharpe_ratio']:.2f}")
     print("==========================================\n")
