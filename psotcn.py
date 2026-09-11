@@ -11,7 +11,7 @@ from joblib import dump, load
 
 # Global Constants & Hyperparameter Constraints
 ticker = "BTC-USD"
-FIXED_TIME_WINDOW = 90
+FIXED_TIME_WINDOW = 60
 FIXED_KERNEL_SIZE = 2
 FIXED_BATCH_SIZE = 32
 DEFAULT_DILATIONS = [1, 2, 4, 8, 16, 32]
@@ -20,37 +20,37 @@ DEFAULT_DILATIONS = [1, 2, 4, 8, 16, 32]
 # Formula: 1 + 2 * (k - 1) * sum(dilations)
 RECEPTIVE_FIELD = 1 + 2 * (FIXED_KERNEL_SIZE - 1) * 1 * sum(DEFAULT_DILATIONS)
 
-print(f"--- Fixed Configuration ---")
+print(f"--- Hybrid TCN-GRU & GWO-WOA Configuration ---")
+print(f"  Target         : Next-Day Log Return (Continuous Regression)")
 print(f"  Kernel Size    : {FIXED_KERNEL_SIZE}")
-print(f"  Time Window    : {FIXED_TIME_WINDOW} days (3 Months)")
+print(f"  Time Window    : {FIXED_TIME_WINDOW} days (2 Months)")
 print(f"  Batch Size     : {FIXED_BATCH_SIZE}")
 print(f"  Dilations      : {DEFAULT_DILATIONS}")
 print(f"  Receptive Field: {RECEPTIVE_FIELD}")
-print(f"---------------------------")
+print(f"----------------------------------------------")
 
-# Boundaries for the 4 search parameters:
-# [0] n_filters: [32, 256]
-# [1] dropout: [0.05, 0.35]
-# [2] log_lr: [-4.5, -2.5]
-# [3] log_weight_decay: [-5.0, -2.0]
+# Boundaries for the 5 search parameters:
+# [0] n_filters       : [32, 256]  (TCN Conv Filters)
+# [1] gru_units       : [32, 256]  (GRU Hidden Units)
+# [2] dropout         : [0.05, 0.40]
+# [3] log_lr          : [-4.5, -2.5] -> 10^log_lr
+# [4] log_weight_decay: [-5.0, -2.0] -> 10^log_wd
 boundaries = [
     (32, 256),     # [0] n_filters
-    (0.05, 0.35),  # [1] dropout
-    (-4.5, -2.5),  # [2] log_lr
-    (-5.0, -2.0)   # [3] log_weight_decay
+    (32, 256),     # [1] gru_units
+    (0.05, 0.40),  # [2] dropout
+    (-4.5, -2.5),  # [3] log_lr
+    (-5.0, -2.0)   # [4] log_weight_decay
 ]
-v_max = [(b[1] - b[0]) * 0.20 for b in boundaries]
 
-# PSO Hyperparameters
-n_particles = 20
+# GWO-WOA Metaheuristic Parameters
+n_agents = 20
 n_iterations = 30
-c1 = 1.8
-c2 = 2.2
 
 # Checkpoint paths
 CHECKPOINT_DIR = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-PSO_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "pso_state.pkl")
+GWO_WOA_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "gwo_woa_state.pkl")
 SEED_CHECKPOINT_DIR = os.path.join(CHECKPOINT_DIR, "seeds")
 os.makedirs(SEED_CHECKPOINT_DIR, exist_ok=True)
 os.makedirs("output/model", exist_ok=True)
@@ -81,26 +81,30 @@ def init_gpu():
 
 def decode_hyperparameters(p):
     """
-    Decodes 4-dimensional continuous PSO particle position into concrete hyperparameters.
-    Fixed: kernel_size = 2, time_window = 60, batch_size = 32.
+    Decodes 5-dimensional continuous GWO-WOA position into concrete hyperparameters.
     """
     # 0. n_filters (multiple of 16 in [32, 256])
     n_filters = int(16 * round(p[0] / 16.0))
     n_filters = max(32, min(256, n_filters))
 
-    # 1. dropout in [0.01, 0.40]
-    dropout = float(np.clip(p[1], 0.01, 0.40))
+    # 1. gru_units (multiple of 16 in [32, 256])
+    gru_units = int(16 * round(p[1] / 16.0))
+    gru_units = max(32, min(256, gru_units))
 
-    # 2. learning_rate
-    log_lr = float(np.clip(p[2], -4.5, -2.5))
+    # 2. dropout in [0.05, 0.40]
+    dropout = float(np.clip(p[2], 0.05, 0.40))
+
+    # 3. learning_rate
+    log_lr = float(np.clip(p[3], -4.5, -2.5))
     learning_rate = 10.0 ** log_lr
 
-    # 3. weight_decay
-    log_wd = float(np.clip(p[3], -5.0, -2.0))
+    # 4. weight_decay
+    log_wd = float(np.clip(p[4], -5.0, -2.0))
     weight_decay = 10.0 ** log_wd
 
     return {
         "n_filters": n_filters,
+        "gru_units": gru_units,
         "dropout": dropout,
         "learning_rate": learning_rate,
         "kernel_size": FIXED_KERNEL_SIZE,
@@ -114,27 +118,41 @@ def decode_hyperparameters(p):
     }
 
 
-def save_pso_checkpoint(iter_count, particle_idx, particles, gbest_position, gbest_value):
+def save_gwo_woa_checkpoint(
+    iter_count,
+    agent_idx,
+    agents,
+    alpha_pos,
+    alpha_score,
+    beta_pos,
+    beta_score,
+    delta_pos,
+    delta_score
+):
     state = {
         "iter_count": iter_count,
-        "particle_idx": particle_idx,
-        "particles": particles,
-        "gbest_position": gbest_position,
-        "gbest_value": gbest_value,
+        "agent_idx": agent_idx,
+        "agents": agents,
+        "alpha_pos": alpha_pos,
+        "alpha_score": alpha_score,
+        "beta_pos": beta_pos,
+        "beta_score": beta_score,
+        "delta_pos": delta_pos,
+        "delta_score": delta_score,
         "python_random_state": random.getstate(),
         "numpy_random_state": np.random.get_state()
     }
-    temp_file = PSO_CHECKPOINT + ".tmp"
+    temp_file = GWO_WOA_CHECKPOINT + ".tmp"
     with open(temp_file, "wb") as f:
         pickle.dump(state, f)
-    os.replace(temp_file, PSO_CHECKPOINT)
+    os.replace(temp_file, GWO_WOA_CHECKPOINT)
 
 
-def load_pso_checkpoint():
-    if not os.path.exists(PSO_CHECKPOINT):
+def load_gwo_woa_checkpoint():
+    if not os.path.exists(GWO_WOA_CHECKPOINT):
         return None
     try:
-        with open(PSO_CHECKPOINT, "rb") as f:
+        with open(GWO_WOA_CHECKPOINT, "rb") as f:
             state = pickle.load(f)
         random.setstate(state["python_random_state"])
         np.random.set_state(state["numpy_random_state"])
@@ -181,9 +199,10 @@ def objective_function(params, precomputed_data, n_features):
     set_seed(42)
     tf.keras.backend.clear_session()
 
-    model = ut.build_tcn_attention_model(
+    model = ut.build_hybrid_tcn_gru_model(
         input_shape=(hp["time_window"], n_features),
         n_filters=hp["n_filters"],
+        gru_units=hp["gru_units"],
         k_size=hp["kernel_size"],
         dropout=hp["dropout"],
         learning_rate=hp["learning_rate"],
@@ -191,8 +210,8 @@ def objective_function(params, precomputed_data, n_features):
         dilations=hp["dilations"]
     )
 
-    early_stop = ut.get_early_stopping(patience=25, monitor='val_auc', mode='max', verbose=0)
-    reduce_lr = ut.get_reduce_lr(monitor='val_auc', factor=0.5, patience=10, mode='max', verbose=0)
+    early_stop = ut.get_early_stopping(patience=20, monitor='val_loss', mode='min', verbose=0)
+    reduce_lr = ut.get_reduce_lr(monitor='val_loss', factor=0.5, patience=10, mode='min', verbose=0)
 
     history = model.fit(
         X_tr,
@@ -205,31 +224,31 @@ def objective_function(params, precomputed_data, n_features):
         verbose=1
     )
 
-    best_val_auc = float(max(history.history.get('val_auc', [0.5])))
-    best_val_loss = float(min(history.history.get('val_loss', [0.693])))
-    fitness = float(1.0 - best_val_auc)
+    best_val_rmse = float(min(history.history.get('val_rmse', [999.0])))
+    best_val_loss = float(min(history.history.get('val_loss', [999.0])))
+    fitness = best_val_rmse
 
-    # Strict memory cleanup to avoid C++ heap accumulation
+    # Strict memory cleanup
     del model
     del history
     tf.keras.backend.clear_session()
     gc.collect()
 
     print(
-        f"  [Eval] Filters={hp['n_filters']}, K={hp['kernel_size']}, "
+        f"  [Eval] Filters={hp['n_filters']}, GRU={hp['gru_units']}, "
         f"Window={hp['time_window']} (RF={hp['receptive_field']}), "
         f"Drop={hp['dropout']:.3f}, LR={hp['learning_rate']:.5f}, "
         f"Batch={hp['batch_size']}, WD={hp['weight_decay']:.5f} | "
-        f"ValAUC={best_val_auc:.4f}, ValLoss={best_val_loss:.4f} | Fitness={fitness:.4f}"
+        f"ValRMSE={best_val_rmse:.5f}, ValLoss={best_val_loss:.5f} | Fitness={fitness:.5f}"
     )
 
     return fitness
 
 
-def run_pso_worker():
+def run_gwo_woa_worker():
     """
-    Executes exactly 1 PSO iteration (or remaining particles of an interrupted iteration),
-    updates velocities & positions, saves checkpoint, and exits.
+    Executes exactly 1 GWO-WOA iteration (or remaining agents of an interrupted iteration),
+    updates positions via hybrid GWO encircling + WOA spiral bubble-net, saves checkpoint, and exits.
     Returns:
         10: Iteration completed, more iterations left.
         20: All iterations completed.
@@ -237,92 +256,163 @@ def run_pso_worker():
     init_gpu()
     train_tab, test_tab = load_tabular_data()
     train_features = train_tab["features"]
-    train_target = train_tab["target"]
+    train_target = train_tab["returns"]  # Next-day log return continuous target
     n_features = train_features.shape[1]
 
     precomputed_data = precache_sequence_data(train_features, train_target)
 
     set_seed(42)
-    checkpoint = load_pso_checkpoint()
+    checkpoint = load_gwo_woa_checkpoint()
 
-    if checkpoint is None or len(checkpoint.get("particles", [{}])[0].get("position", [])) != len(boundaries):
-        particles = []
-        for _ in range(n_particles):
+    if checkpoint is None or len(checkpoint.get("agents", [{}])[0].get("position", [])) != len(boundaries):
+        agents = []
+        for _ in range(n_agents):
             pos = [random.uniform(b[0], b[1]) for b in boundaries]
-            vel = [0.0] * len(boundaries)
-            particles.append({
+            agents.append({
                 'position': pos,
-                'velocity': vel,
-                'pbest_position': pos.copy(),
-                'pbest_value': float('inf')
+                'fitness': float('inf')
             })
-        gbest_position = None
-        gbest_value = float('inf')
+        alpha_pos = None
+        alpha_score = float('inf')
+        beta_pos = None
+        beta_score = float('inf')
+        delta_pos = None
+        delta_score = float('inf')
         start_iter = 0
-        start_particle = 0
+        start_agent = 0
     else:
-        particles = checkpoint["particles"]
-        gbest_position = checkpoint["gbest_position"]
-        gbest_value = checkpoint["gbest_value"]
+        agents = checkpoint["agents"]
+        alpha_pos = checkpoint["alpha_pos"]
+        alpha_score = checkpoint["alpha_score"]
+        beta_pos = checkpoint["beta_pos"]
+        beta_score = checkpoint["beta_score"]
+        delta_pos = checkpoint["delta_pos"]
+        delta_score = checkpoint["delta_score"]
         start_iter = checkpoint["iter_count"]
-        start_particle = checkpoint["particle_idx"] + 1
+        start_agent = checkpoint["agent_idx"] + 1
 
     # Check if already complete
-    if start_iter >= n_iterations and checkpoint is not None and checkpoint.get("particle_idx") == -1:
-        print(f"PSO Optimization is already complete ({start_iter}/{n_iterations} iterations).")
-        best_hp = decode_hyperparameters(gbest_position)
+    if start_iter >= n_iterations and checkpoint is not None and checkpoint.get("agent_idx") == -1:
+        print(f"GWO-WOA Optimization is already complete ({start_iter}/{n_iterations} iterations).")
+        best_hp = decode_hyperparameters(alpha_pos)
         dump(best_hp, "output/model/best_hyperparameters.joblib")
         return 20
 
     iter_count = start_iter
-    w = 0.9 - (0.5 * iter_count / n_iterations)
-    print(f"\n--- [Process Worker] PSO Iteration {iter_count + 1}/{n_iterations} (Inertia w={w:.3f}) ---")
+    a = 2.0 - (2.0 * iter_count / n_iterations)  # Linearly decreases from 2 to 0
+    print(f"\n--- [Process Worker] Hybrid GWO-WOA Iteration {iter_count + 1}/{n_iterations} (a={a:.3f}) ---")
 
-    for i in range(start_particle, n_particles):
-        particle = particles[i]
-        print(f"Evaluating Particle {i + 1}/{n_particles}:")
+    for i in range(start_agent, n_agents):
+        agent = agents[i]
+        print(f"Evaluating Search Agent {i + 1}/{n_agents}:")
 
-        current_val = objective_function(
-            particle['position'],
+        fitness = objective_function(
+            agent['position'],
             precomputed_data,
             n_features
         )
+        agent['fitness'] = fitness
 
-        if current_val < particle['pbest_value']:
-            particle['pbest_value'] = current_val
-            particle['pbest_position'] = particle['position'].copy()
+        # Update Alpha, Beta, Delta wolves
+        if fitness < alpha_score:
+            delta_score = beta_score
+            delta_pos = beta_pos.copy() if beta_pos is not None else None
+            beta_score = alpha_score
+            beta_pos = alpha_pos.copy() if alpha_pos is not None else None
+            alpha_score = fitness
+            alpha_pos = agent['position'].copy()
+            print(f"  >>> New Alpha Leader Fitness (RMSE): {alpha_score:.5f}")
+        elif fitness < beta_score:
+            delta_score = beta_score
+            delta_pos = beta_pos.copy() if beta_pos is not None else None
+            beta_score = fitness
+            beta_pos = agent['position'].copy()
+            print(f"  >>> New Beta Leader Fitness (RMSE): {beta_score:.5f}")
+        elif fitness < delta_score:
+            delta_score = fitness
+            delta_pos = agent['position'].copy()
+            print(f"  >>> New Delta Leader Fitness (RMSE): {delta_score:.5f}")
 
-        if current_val < gbest_value:
-            gbest_value = current_val
-            gbest_position = particle['position'].copy()
-            print(f"  >>> New Global Best Fitness: {gbest_value:.5f} (Val AUC: {1.0 - gbest_value:.4f})")
+        # Fallback initialization if leaders are not yet populated
+        if beta_pos is None:
+            beta_pos = alpha_pos.copy()
+            beta_score = alpha_score
+        if delta_pos is None:
+            delta_pos = alpha_pos.copy()
+            delta_score = alpha_score
 
-        save_pso_checkpoint(iter_count, i, particles, gbest_position, gbest_value)
+        save_gwo_woa_checkpoint(
+            iter_count, i, agents,
+            alpha_pos, alpha_score,
+            beta_pos, beta_score,
+            delta_pos, delta_score
+        )
 
-    # Velocity and position updates for all particles
-    for particle in particles:
-        for j in range(len(boundaries)):
-            r1, r2 = random.random(), random.random()
-            cog = c1 * r1 * (particle['pbest_position'][j] - particle['position'][j])
-            soc = c2 * r2 * (gbest_position[j] - particle['position'][j])
-            v = (w * particle['velocity'][j]) + cog + soc
-            v = max(-v_max[j], min(v_max[j], v))
-            particle['velocity'][j] = v
+    # Hybrid Position Updates (GWO Encircling + WOA Spiral Bubble-Net)
+    b = 1.0  # Spiral constant for WOA
+    for agent in agents:
+        p = random.random()
+        pos = agent['position']
+        new_pos = [0.0] * len(boundaries)
 
-            new_pos = particle['position'][j] + v
-            new_pos = max(boundaries[j][0], min(boundaries[j][1], new_pos))
-            particle['position'][j] = new_pos
+        if p < 0.5:
+            # GWO Encircling / Exploitation guided by Alpha, Beta, Delta or Random Exploration
+            for j in range(len(boundaries)):
+                r1_1, r2_1 = random.random(), random.random()
+                r1_2, r2_2 = random.random(), random.random()
+                r1_3, r2_3 = random.random(), random.random()
+
+                A1 = 2.0 * a * r1_1 - a
+                C1 = 2.0 * r2_1
+                A2 = 2.0 * a * r1_2 - a
+                C2 = 2.0 * r2_2
+                A3 = 2.0 * a * r1_3 - a
+                C3 = 2.0 * r2_3
+
+                if abs(A1) < 1.0:
+                    # GWO Encircling around Alpha, Beta, Delta
+                    D_alpha = abs(C1 * alpha_pos[j] - pos[j])
+                    X1 = alpha_pos[j] - A1 * D_alpha
+
+                    D_beta = abs(C2 * beta_pos[j] - pos[j])
+                    X2 = beta_pos[j] - A2 * D_beta
+
+                    D_delta = abs(C3 * delta_pos[j] - pos[j])
+                    X3 = delta_pos[j] - A3 * D_delta
+
+                    new_val = (X1 + X2 + X3) / 3.0
+                else:
+                    # Exploration: Search for prey with random agent
+                    rand_agent = random.choice(agents)
+                    D_rand = abs(C1 * rand_agent['position'][j] - pos[j])
+                    new_val = rand_agent['position'][j] - A1 * D_rand
+
+                new_pos[j] = max(boundaries[j][0], min(boundaries[j][1], new_val))
+        else:
+            # WOA Bubble-net spiral update around Alpha Leader
+            l = random.uniform(-1.0, 1.0)
+            for j in range(len(boundaries)):
+                dist_to_alpha = abs(alpha_pos[j] - pos[j])
+                spiral_step = dist_to_alpha * np.exp(b * l) * np.cos(2.0 * np.pi * l) + alpha_pos[j]
+                new_pos[j] = max(boundaries[j][0], min(boundaries[j][1], spiral_step))
+
+        agent['position'] = new_pos
 
     next_iter = iter_count + 1
-    save_pso_checkpoint(next_iter, -1, particles, gbest_position, gbest_value)
+    save_gwo_woa_checkpoint(
+        next_iter, -1, agents,
+        alpha_pos, alpha_score,
+        beta_pos, beta_score,
+        delta_pos, delta_score
+    )
 
     print(f"--- [Process Worker] Iteration {iter_count + 1} completed and saved to checkpoint ---")
 
     if next_iter >= n_iterations:
         print("\n==========================================")
-        print("PSO OPTIMIZATION COMPLETED!")
-        best_hp = decode_hyperparameters(gbest_position)
-        print(f"Best Fitness Value (1 - AUC) : {gbest_value:.5f} (AUC: {1.0 - gbest_value:.4f})")
+        print("HYBRID GWO-WOA OPTIMIZATION COMPLETED!")
+        best_hp = decode_hyperparameters(alpha_pos)
+        print(f"Best Fitness Value (Val RMSE) : {alpha_score:.5f}")
         print("Optimal Hyperparameters:")
         for k, v in best_hp.items():
             if not k.startswith(('log_', 'k_', 'b_')):
@@ -336,39 +426,40 @@ def run_pso_worker():
 
 def run_final_ensemble():
     """
-    Trains 5 multi-seed models, evaluates the ensemble, generates backtest metrics, and saves plots.
+    Trains 5 multi-seed Hybrid TCN-GRU models, evaluates ensemble regression & financial backtest,
+    and saves plots.
     """
     import tensorflow as tf
     import utils as ut
-    from sklearn.metrics import roc_curve, ConfusionMatrixDisplay
 
     init_gpu()
     train_tab, test_tab = load_tabular_data()
     train_features = train_tab["features"]
-    train_target = train_tab["target"]
+    train_target = train_tab["returns"]  # Next-day continuous log return
     train_prices = train_tab["prices"]
-    train_returns = train_tab["returns"]
     test_features = test_tab["features"]
-    test_target = test_tab["target"]
+    test_target = test_tab["returns"]
     test_prices = test_tab["prices"]
-    test_returns = test_tab["returns"]
     n_features = train_features.shape[1]
 
     hp_path = "output/model/best_hyperparameters.joblib"
     if os.path.exists(hp_path):
         best_hp = load(hp_path)
     else:
-        cp = load_pso_checkpoint()
-        if cp and cp.get("gbest_position") is not None:
-            best_hp = decode_hyperparameters(cp["gbest_position"])
+        cp = load_gwo_woa_checkpoint()
+        if cp and cp.get("alpha_pos") is not None:
+            best_hp = decode_hyperparameters(cp["alpha_pos"])
             dump(best_hp, hp_path)
         else:
-            raise FileNotFoundError("Could not find best_hyperparameters.joblib or valid PSO checkpoint.")
+            raise FileNotFoundError("Could not find best_hyperparameters.joblib or valid GWO-WOA checkpoint.")
 
     print("\n==========================================")
-    print("5. MULTI-SEED ENSEMBLE TRAINING (5 SEEDS)")
+    print("5. MULTI-SEED HYBRID TCN-GRU ENSEMBLE TRAINING (5 SEEDS)")
     print("==========================================")
-    print(f"Using Optimal Parameters (Window={best_hp['time_window']}, Filters={best_hp['n_filters']}, K={best_hp['kernel_size']})...")
+    print(
+        f"Using Optimal Parameters (Window={best_hp['time_window']}, Filters={best_hp['n_filters']}, "
+        f"GRU={best_hp['gru_units']}, K={best_hp['kernel_size']})..."
+    )
 
     best_window = best_hp["time_window"]
     X_train_final, y_train_final = ut.create_sequences(train_features, train_target, best_window)
@@ -391,7 +482,7 @@ def run_final_ensemble():
     individual_predictions = []
     val_individual_predictions = []
     seed_histories = []
-    seed_val_aucs = []
+    seed_val_rmses = []
 
     plt.figure(figsize=(10, 5))
 
@@ -405,22 +496,23 @@ def run_final_ensemble():
             with open(seed_history_path, "rb") as f:
                 history = pickle.load(f)
         else:
-            print(f"\n--- Training Model with Seed {seed} ---")
+            print(f"\n--- Training Hybrid TCN-GRU with Seed {seed} ---")
             set_seed(seed)
             tf.keras.backend.clear_session()
 
-            model = ut.build_tcn_attention_model(
+            model = ut.build_hybrid_tcn_gru_model(
                 input_shape=(best_window, n_features),
                 n_filters=best_hp["n_filters"],
+                gru_units=best_hp["gru_units"],
                 k_size=best_hp["kernel_size"],
                 dropout=best_hp["dropout"],
                 learning_rate=best_hp["learning_rate"],
                 weight_decay=best_hp["weight_decay"],
-                dilations=best_hp.get("dilations", [1, 2, 4, 8, 16])
+                dilations=best_hp.get("dilations", DEFAULT_DILATIONS)
             )
 
-            early_stopping = ut.get_early_stopping(patience=20, monitor='val_auc', mode='max', verbose=1)
-            reduce_lr = ut.get_reduce_lr(monitor='val_auc', factor=0.5, patience=10, mode='max', verbose=0)
+            early_stopping = ut.get_early_stopping(patience=20, monitor='val_loss', mode='min', verbose=1)
+            reduce_lr = ut.get_reduce_lr(monitor='val_loss', factor=0.5, patience=10, mode='min', verbose=0)
 
             history_obj = model.fit(
                 X_tr_final,
@@ -439,133 +531,118 @@ def run_final_ensemble():
                 pickle.dump(history, f)
 
         # Predict on validation and test sets
-        val_prob = model.predict(X_val_final, verbose=0).ravel()
-        val_individual_predictions.append(val_prob)
+        val_pred = model.predict(X_val_final, verbose=0).ravel()
+        val_individual_predictions.append(val_pred)
 
-        prob_pred = model.predict(X_test_final, verbose=0).ravel()
-        individual_predictions.append(prob_pred)
+        pred = model.predict(X_test_final, verbose=0).ravel()
+        individual_predictions.append(pred)
 
-        seed_metrics = ut.compute_classification_metrics(y_test_final, prob_pred)
-        print(f"Seed {seed}: Acc={seed_metrics['accuracy']*100:.2f}%, AUC={seed_metrics['auc']:.4f}, LogLoss={seed_metrics['log_loss']:.4f}")
+        seed_metrics = ut.compute_regression_metrics(y_test_final, pred)
+        print(f"Seed {seed}: RMSE={seed_metrics['rmse']:.5f}, MAE={seed_metrics['mae']:.5f}, R2={seed_metrics['r2']:.4f}, DA={seed_metrics['directional_accuracy']:.2f}%")
 
         seed_histories.append(history)
-        max_val_auc = max(history.get('val_auc', [0.5]))
-        seed_val_aucs.append(max_val_auc)
+        min_val_rmse = min(history.get('val_rmse', [999.0]))
+        seed_val_rmses.append(min_val_rmse)
 
-        plt.plot(history.get('val_auc', []), label=f"Seed {seed} Val AUC (max={max_val_auc:.4f})")
+        plt.plot(history.get('val_loss', []), label=f"Seed {seed} Val Loss (min RMSE={min_val_rmse:.5f})")
 
         del model
         tf.keras.backend.clear_session()
         gc.collect()
 
-    plt.title("TCN + Multi-Head Attention Multi-Seed Validation ROC-AUC")
+    plt.title("Hybrid TCN-GRU Multi-Seed Validation Huber Loss")
     plt.xlabel("Epoch")
-    plt.ylabel("Validation ROC-AUC")
+    plt.ylabel("Validation Loss")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.savefig("output/plots/training_losses.png", dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 6. Ensemble Evaluation & Validation-based Threshold Calibration
+    # 6. Ensemble Evaluation
     print("\n--- Generating Multi-Seed Ensemble Predictions ---")
-    val_ensemble_probs = np.mean(val_individual_predictions, axis=0)
-    optimal_threshold = ut.find_optimal_threshold(y_val_final, val_ensemble_probs)
-    print(f"Calibrated Optimal Decision Threshold (Youden's J on Validation): {optimal_threshold:.4f}")
+    ensemble_predictions = np.mean(individual_predictions, axis=0)
+    ensemble_metrics = ut.compute_regression_metrics(y_test_final, ensemble_predictions)
 
-    ensemble_probabilities = np.mean(individual_predictions, axis=0)
-    ensemble_metrics = ut.compute_classification_metrics(y_test_final, ensemble_probabilities, threshold=optimal_threshold)
-    std_ensemble_metrics = ut.compute_classification_metrics(y_test_final, ensemble_probabilities, threshold=0.50)
-
-    test_eval_returns = test_returns[-len(y_test_final):]
+    test_eval_returns = test_target[-len(y_test_final):]
     test_eval_prices = test_prices[-len(y_test_final):]
-    backtest_res = ut.backtest_directional_strategy(test_eval_returns, ensemble_probabilities, threshold=optimal_threshold)
+    backtest_res = ut.backtest_return_strategy(test_eval_returns, ensemble_predictions, threshold=0.0)
 
     print("\n==========================================")
-    print("FINAL ENSEMBLE TEST PERFORMANCE (CALIBRATED THRESHOLD)")
+    print("FINAL HYBRID TCN-GRU ENSEMBLE REGRESSION PERFORMANCE")
     print("==========================================")
-    print(f"Optimal Decision Thresh : {optimal_threshold:.4f} (vs standard 0.50)")
-    print(f"Ensemble Accuracy (Cal) : {ensemble_metrics['accuracy']*100:.2f}% (Standard 0.5: {std_ensemble_metrics['accuracy']*100:.2f}%)")
-    print(f"Ensemble ROC-AUC Score  : {ensemble_metrics['auc']:.4f}")
-    print(f"Ensemble Precision      : {ensemble_metrics['precision']*100:.2f}%")
-    print(f"Ensemble Recall         : {ensemble_metrics['recall']*100:.2f}%")
-    print(f"Ensemble F1-Score       : {ensemble_metrics['f1']:.4f}")
-    print(f"Brier Score (Calibration): {ensemble_metrics['brier_score']:.4f}")
-    print(f"Mean Prediction Certainty: {ensemble_metrics['confidence_mean']:.2f}%")
-    print(f"High-Confidence Accuracy: {ensemble_metrics['high_conf_acc']*100:.2f}% (Coverage: {ensemble_metrics['high_conf_coverage']:.1f}%)")
-    print(f"Strategy Cumulative Ret : {backtest_res['total_strategy_return']:.2f}% (vs Market Buy&Hold: {backtest_res['total_market_return']:.2f}%)")
-    print(f"Strategy Sharpe Ratio   : {backtest_res['sharpe_ratio']:.2f}")
+    print(f"Ensemble RMSE (Log Return) : {ensemble_metrics['rmse']:.6f}")
+    print(f"Ensemble MAE  (Log Return) : {ensemble_metrics['mae']:.6f}")
+    print(f"Ensemble MSE               : {ensemble_metrics['mse']:.8f}")
+    print(f"Ensemble R2 Score          : {ensemble_metrics['r2']:.4f}")
+    print(f"Directional Accuracy (DA)  : {ensemble_metrics['directional_accuracy']:.2f}%")
+    print(f"Pearson Correlation (r)    : {ensemble_metrics['pearson_corr']:.4f}")
+    print(f"Strategy Cumulative Return : {backtest_res['total_strategy_return']:.2f}% (vs Market Buy&Hold: {backtest_res['total_market_return']:.2f}%)")
+    print(f"Strategy Sharpe Ratio      : {backtest_res['sharpe_ratio']:.2f}")
+    print(f"Strategy Max Drawdown      : {backtest_res['max_drawdown']:.2f}%")
     print("==========================================\n")
 
-    best_hp["optimal_threshold"] = optimal_threshold
     evaluation_summary = {
         "ensemble_metrics": ensemble_metrics,
-        "std_ensemble_metrics": std_ensemble_metrics,
-        "optimal_threshold": optimal_threshold,
         "backtest_results": backtest_res,
         "best_hyperparameters": best_hp,
-        "seed_val_aucs": seed_val_aucs
+        "seed_val_rmses": seed_val_rmses
     }
     dump(evaluation_summary, "output/model/ensemble_evaluation.joblib")
     dump(best_hp, "output/model/best_hyperparameters.joblib")
 
-    # 7. Generate Plots
-    # A. ROC Curve
-    fpr, tpr, _ = roc_curve(y_test_final, ensemble_probabilities)
-    plt.figure(figsize=(7, 6))
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'Ensemble ROC (AUC = {ensemble_metrics["auc"]:.3f})')
-    plt.plot([0, 1], [0, 1], color='navy', lw=1.5, linestyle='--')
-    plt.xlabel('False Positive Rate (1 - Specificity)')
-    plt.ylabel('True Positive Rate (Sensitivity)')
-    plt.title(f'ROC Curve - Directional Movement ({ticker})')
-    plt.legend(loc='lower right')
+    # 7. Generate Regression & Financial Plots
+    # A. Actual vs Predicted Log Returns
+    plt.figure(figsize=(14, 6))
+    plt.plot(y_test_final, label='Actual Next-Day Log Return', color='black', alpha=0.6, lw=1.2)
+    plt.plot(ensemble_predictions, label=f'Hybrid TCN-GRU Predicted (RMSE={ensemble_metrics["rmse"]:.4f})', color='royalblue', lw=1.5)
+    plt.axhline(0, color='gray', linestyle='--', alpha=0.5)
+    plt.title(f'{ticker} Next-Day Log Return: Actual vs Hybrid TCN-GRU Ensemble Prediction')
+    plt.xlabel('Test Sample Days')
+    plt.ylabel('Log Return')
+    plt.legend(loc='upper left')
     plt.grid(True, alpha=0.3)
-    plt.savefig('output/plots/roc_curve.png', dpi=300, bbox_inches='tight')
+    plt.savefig('output/plots/actual_vs_predicted_returns.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    # B. Confusion Matrix
-    cm = ensemble_metrics['confusion_matrix']
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Down (0)', 'Up (1)'])
-    fig, ax = plt.subplots(figsize=(6, 5))
-    disp.plot(ax=ax, cmap='Blues', values_format='d')
-    plt.title(f'Confusion Matrix (Threshold = {optimal_threshold:.3f})')
-    plt.savefig('output/plots/confusion_matrix.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # C. Probability & Confidence Distribution
-    confidences = np.abs(ensemble_probabilities - optimal_threshold) * 2.0 * 100.0
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    ax1.hist(ensemble_probabilities, bins=25, color='teal', edgecolor='black', alpha=0.7)
-    ax1.axvline(optimal_threshold, color='red', linestyle='--', label=f'Optimal Threshold ({optimal_threshold:.3f})')
-    ax1.axvline(0.50, color='gray', linestyle=':', label='Default (0.50)')
-    ax1.set_title('Predicted Probability Distribution P(Up)')
-    ax1.set_xlabel('Probability P(Up)')
-    ax1.set_ylabel('Frequency')
+    # B. Residual Analysis & Scatter
+    residuals = y_test_final - ensemble_predictions
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    ax1.scatter(y_test_final, ensemble_predictions, alpha=0.5, color='teal', s=20)
+    min_v = min(np.min(y_test_final), np.min(ensemble_predictions))
+    max_v = max(np.max(y_test_final), np.max(ensemble_predictions))
+    ax1.plot([min_v, max_v], [min_v, max_v], color='red', linestyle='--', label='Identity (Ideal)')
+    ax1.set_title('Actual vs Predicted Scatter Plot')
+    ax1.set_xlabel('Actual Log Return')
+    ax1.set_ylabel('Predicted Log Return')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
-    ax2.hist(confidences, bins=25, color='purple', edgecolor='black', alpha=0.7)
-    ax2.set_title('Prediction Confidence Distribution (%)')
-    ax2.set_xlabel('Confidence (%) [0% = Uncertain, 100% = Certain]')
+    ax2.hist(residuals, bins=30, color='mediumpurple', edgecolor='black', alpha=0.7)
+    ax2.axvline(0, color='red', linestyle='--', label=f'Mean Error ({np.mean(residuals):.5f})')
+    ax2.set_title('Prediction Residuals Distribution')
+    ax2.set_xlabel('Residual (Actual - Predicted)')
     ax2.set_ylabel('Frequency')
+    ax2.legend()
     ax2.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig('output/plots/probability_confidence.png', dpi=300, bbox_inches='tight')
+    plt.savefig('output/plots/residual_analysis.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    # D. Backtest vs Price
+    # C. Backtest vs Price
     plt.figure(figsize=(14, 7))
     ax_top = plt.subplot(2, 1, 1)
     ax_top.plot(test_eval_prices, label=f'{ticker} Actual Close Price', color='black', alpha=0.8)
-    up_signals = np.where(ensemble_probabilities >= optimal_threshold)[0]
-    down_signals = np.where(ensemble_probabilities < optimal_threshold)[0]
-    ax_top.scatter(up_signals, test_eval_prices[up_signals], color='green', marker='^', s=25, label=f'Signal UP (P >= {optimal_threshold:.2f})', alpha=0.7)
-    ax_top.scatter(down_signals, test_eval_prices[down_signals], color='red', marker='v', s=25, label=f'Signal DOWN (P < {optimal_threshold:.2f})', alpha=0.7)
-    ax_top.set_title(f'Ensemble Model Directional Signals vs {ticker} Price')
+    long_signals = np.where(ensemble_predictions > 0)[0]
+    cash_signals = np.where(ensemble_predictions <= 0)[0]
+    ax_top.scatter(long_signals, test_eval_prices[long_signals], color='green', marker='^', s=25, label='Signal Long (Pred Return > 0)', alpha=0.7)
+    ax_top.scatter(cash_signals, test_eval_prices[cash_signals], color='red', marker='v', s=25, label='Signal Cash (Pred Return <= 0)', alpha=0.7)
+    ax_top.set_title(f'Hybrid TCN-GRU Predicted Signals vs {ticker} Price')
     ax_top.legend(loc='upper left')
     ax_top.grid(True, alpha=0.3)
 
     ax_bot = plt.subplot(2, 1, 2)
-    ax_bot.plot(backtest_res['cumulative_strategy'] * 100, label=f'PSO-TCN Strategy ({backtest_res["total_strategy_return"]:.1f}%)', color='green', lw=1.8)
+    ax_bot.plot(backtest_res['cumulative_strategy'] * 100, label=f'Hybrid TCN-GRU Strategy ({backtest_res["total_strategy_return"]:.1f}%)', color='green', lw=1.8)
     ax_bot.plot(backtest_res['cumulative_market'] * 100, label=f'Buy & Hold Benchmark ({backtest_res["total_market_return"]:.1f}%)', color='gray', linestyle='--', lw=1.5)
     ax_bot.set_title('Cumulative Return Backtest (%)')
     ax_bot.set_xlabel('Test Sample Days')
@@ -582,31 +659,32 @@ def run_final_ensemble():
 
 def run_orchestrator(script_path):
     print("==========================================================")
-    print(" PSO-TCN ORCHESTRATOR: Process Isolation Enabled")
-    print(f" Target: {n_iterations} Iterations, {n_particles} Particles")
+    print(" HYBRID GWO-WOA ORCHESTRATOR: Process Isolation Enabled")
+    print(f" Target: {n_iterations} Iterations, {n_agents} Agents")
+    print(" Model : Hybrid TCN-GRU (Next-Day Log Return Regression)")
     print(" Process is terminated after each iteration to free 100% RAM.")
     print("==========================================================")
 
     while True:
-        checkpoint = load_pso_checkpoint()
+        checkpoint = load_gwo_woa_checkpoint()
         if checkpoint is not None:
             iter_count = checkpoint["iter_count"]
-            particle_idx = checkpoint["particle_idx"]
-            if iter_count >= n_iterations and particle_idx == -1:
-                print(f"\n[Orchestrator] All {n_iterations} PSO iterations are complete!")
+            agent_idx = checkpoint["agent_idx"]
+            if iter_count >= n_iterations and agent_idx == -1:
+                print(f"\n[Orchestrator] All {n_iterations} GWO-WOA iterations are complete!")
                 break
             current_iter = iter_count + 1
-            current_particle = particle_idx + 1
+            current_agent = agent_idx + 1
         else:
             current_iter = 1
-            current_particle = 0
+            current_agent = 0
 
-        print(f"\n[Orchestrator] Starting fresh Python process for Iteration {current_iter}/{n_iterations} (Particle {current_particle + 1}/{n_particles})...")
+        print(f"\n[Orchestrator] Starting fresh Python process for Iteration {current_iter}/{n_iterations} (Agent {current_agent + 1}/{n_agents})...")
         cmd = [sys.executable, script_path, "--worker"]
         result = subprocess.run(cmd)
 
         if result.returncode == 20:
-            print("\n[Orchestrator] PSO Optimization completed.")
+            print("\n[Orchestrator] GWO-WOA Optimization completed.")
             break
         elif result.returncode not in (0, 10):
             print(f"\n[Orchestrator] Worker exited with error code {result.returncode}. Stopping.")
@@ -618,7 +696,7 @@ def run_orchestrator(script_path):
 
     if result.returncode == 0:
         print("\n==========================================================")
-        print(" ALL PSO-TCN TRAINING AND EVALUATIONS FINISHED!")
+        print(" ALL HYBRID TCN-GRU TRAINING AND EVALUATIONS FINISHED!")
         print("==========================================================")
     else:
         print(f"[Orchestrator] Final ensemble process failed with code {result.returncode}.")
@@ -626,8 +704,8 @@ def run_orchestrator(script_path):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PSO-TCN Directional Prediction for Bitcoin")
-    parser.add_argument("--worker", action="store_true", help="Run a single PSO iteration in a dedicated worker process")
+    parser = argparse.ArgumentParser(description="Hybrid TCN-GRU with GWO-WOA Optimization for BTC Next-Day Log Return")
+    parser.add_argument("--worker", action="store_true", help="Run a single GWO-WOA iteration in a dedicated worker process")
     parser.add_argument("--single-iter", action="store_true", help="Alias for --worker: run 1 iteration and exit")
     parser.add_argument("--final-ensemble", action="store_true", help="Run 5-seed ensemble training and evaluation only")
     parser.add_argument("--no-orchestrator", action="store_true", help="Run all iterations continuously in a single process without recycling")
@@ -636,14 +714,14 @@ if __name__ == "__main__":
     script_path = os.path.abspath(__file__)
 
     if args.worker or args.single_iter:
-        exit_code = run_pso_worker()
+        exit_code = run_gwo_woa_worker()
         sys.exit(exit_code)
     elif args.final_ensemble:
         exit_code = run_final_ensemble()
         sys.exit(exit_code)
     elif args.no_orchestrator:
         while True:
-            code = run_pso_worker()
+            code = run_gwo_woa_worker()
             if code == 20:
                 break
         run_final_ensemble()

@@ -11,7 +11,11 @@ from sklearn.metrics import (
     f1_score,
     log_loss,
     brier_score_loss,
-    confusion_matrix
+    confusion_matrix,
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score,
+    explained_variance_score
 )
 
 def create_sequences(features, target, window):
@@ -37,9 +41,6 @@ def compute_receptive_field(k_size, dilations=(1, 2, 4, 8, 16, 32), nb_stacks=1)
 def get_focal_loss(gamma=2.0, alpha=0.50, label_smoothing=0.05):
     """
     Returns Symmetric Binary Focal Loss with Label Smoothing.
-    - Down-weights easy examples and forces the network to focus on hard directional moves.
-    - Label smoothing (0.05) prevents over-fitting to noisy financial targets.
-    - Symmetric alpha=0.50 ensures equal penalization of UP and DOWN errors.
     """
     def focal_loss(y_true, y_pred):
         y_true = tf.cast(y_true, tf.float32)
@@ -57,7 +58,6 @@ def get_focal_loss(gamma=2.0, alpha=0.50, label_smoothing=0.05):
 def find_optimal_threshold(y_true, y_prob):
     """
     Finds the optimal classification threshold using Youden's J-statistic on the ROC curve.
-    J = TPR - FPR = Sensitivity + Specificity - 1
     """
     from sklearn.metrics import roc_curve
     y_true = np.asarray(y_true).ravel()
@@ -68,28 +68,35 @@ def find_optimal_threshold(y_true, y_prob):
     j_scores = tpr - fpr
     optimal_idx = np.argmax(j_scores)
     optimal_thresh = float(thresholds[optimal_idx])
-    # Safeguard within reasonable financial probability range [0.35, 0.65]
     return float(np.clip(optimal_thresh, 0.35, 0.65))
 
-def build_tcn_attention_model(
+def build_hybrid_tcn_gru_model(
     input_shape,
     n_filters,
-    k_size,
-    dropout,
-    learning_rate,
+    gru_units,
+    k_size=2,
+    dropout=0.20,
+    learning_rate=1e-3,
     weight_decay=1e-4,
     dilations=None
 ):
     """
-    Builds a TCN model with Multi-Head Attention, Dual Temporal Pooling
-    (last causal timestep + global average pool), and a 3-layer deep classification head.
+    Builds a Hybrid TCN-GRU Regression Model for continuous next-day log return prediction.
+    Architecture:
+    1. Input Sequence (window, n_features)
+    2. Causal Dilated TCN layer for multi-scale temporal receptive field
+    3. GRU layer for recurrent sequential temporal dynamics
+    4. Multi-Head Temporal Self-Attention + Residual Connection + LayerNorm
+    5. Dual Temporal Pooling (last causal timestep + global average pooling)
+    6. Deep Regression Head with GELU, BatchNorm, and Dropout
+    7. Linear output predicting 1-step ahead continuous log return
     """
     if dilations is None:
         dilations = [1, 2, 4, 8, 16, 32]
 
     inputs = layers.Input(shape=input_shape, name="input_sequence")
-    
-    # 1. Temporal Convolutional Network with causal padding and sequence output
+
+    # 1. Temporal Convolutional Network (TCN)
     tcn_out = TCN(
         nb_filters=int(n_filters),
         kernel_size=int(k_size),
@@ -102,7 +109,95 @@ def build_tcn_attention_model(
         name="tcn_layer"
     )(inputs)
 
-    # 2. Multi-Head Temporal Self-Attention
+    # 2. Gated Recurrent Unit (GRU)
+    gru_out = layers.GRU(
+        units=int(gru_units),
+        return_sequences=True,
+        dropout=float(dropout),
+        name="gru_layer"
+    )(tcn_out)
+
+    # 3. Multi-Head Temporal Self-Attention over sequential representations
+    num_heads = 2
+    key_dim = max(16, int(gru_units // num_heads))
+    attn_out = layers.MultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=key_dim,
+        name="temporal_mha"
+    )(gru_out, gru_out)
+
+    # Residual Connection + Layer Normalization
+    x = layers.Add(name="attn_residual")([gru_out, attn_out])
+    x = layers.LayerNormalization(name="layer_norm")(x)
+
+    # 4. Dual Temporal Pooling: Last causal timestep + Global Average Pooling
+    last_step = layers.Lambda(lambda t: t[:, -1, :], name="last_step_extraction")(x)
+    avg_pool = layers.GlobalAveragePooling1D(name="global_avg_pool")(x)
+    pooled = layers.Concatenate(name="dual_temporal_pooled")([last_step, avg_pool])
+
+    # 5. Deep Regression Head
+    h = layers.Dense(64, activation='gelu', name="dense_head_1")(pooled)
+    h = layers.BatchNormalization(name="bn_1")(h)
+    h = layers.Dropout(float(dropout), name="dropout_1")(h)
+
+    h = layers.Dense(32, activation='gelu', name="dense_head_2")(h)
+    h = layers.Dropout(float(dropout), name="dropout_2")(h)
+
+    # 6. Linear Output Layer (Next-Day Log Return)
+    outputs = layers.Dense(1, activation='linear', name="predicted_log_return")(h)
+
+    model = Model(inputs=inputs, outputs=outputs, name="Hybrid_TCN_GRU_Regressor")
+
+    # Optimizer with decoupled weight decay (AdamW)
+    optimizer = tf.keras.optimizers.AdamW(
+        learning_rate=float(learning_rate),
+        weight_decay=float(weight_decay)
+    )
+
+    # Huber loss is robust to crypto return outliers and heavy-tailed shocks
+    loss_fn = tf.keras.losses.Huber(delta=1.0)
+
+    model.compile(
+        optimizer=optimizer,
+        loss=loss_fn,
+        metrics=[
+            'mae',
+            'mse',
+            tf.keras.metrics.RootMeanSquaredError(name='rmse')
+        ]
+    )
+
+    return model
+
+def build_tcn_attention_model(
+    input_shape,
+    n_filters,
+    k_size,
+    dropout,
+    learning_rate,
+    weight_decay=1e-4,
+    dilations=None
+):
+    """
+    Builds a TCN model with Multi-Head Attention for classification (backward compatibility).
+    """
+    if dilations is None:
+        dilations = [1, 2, 4, 8, 16, 32]
+
+    inputs = layers.Input(shape=input_shape, name="input_sequence")
+    
+    tcn_out = TCN(
+        nb_filters=int(n_filters),
+        kernel_size=int(k_size),
+        nb_stacks=1,
+        dilations=dilations,
+        padding='causal',
+        use_skip_connections=True,
+        dropout_rate=float(dropout),
+        return_sequences=True,
+        name="tcn_layer"
+    )(inputs)
+
     num_heads = 2
     key_dim = max(16, int(n_filters // num_heads))
     attn_out = layers.MultiHeadAttention(
@@ -111,16 +206,13 @@ def build_tcn_attention_model(
         name="temporal_mha"
     )(tcn_out, tcn_out)
 
-    # Residual Connection + Layer Normalization
     x = layers.Add(name="attn_residual")([tcn_out, attn_out])
     x = layers.LayerNormalization(name="layer_norm")(x)
 
-    # 3. Dual Temporal Pooling: Last-step (most recent causal state) + Global Avg Pooling
     last_step = layers.Lambda(lambda t: t[:, -1, :], name="last_step_extraction")(x)
     avg_pool = layers.GlobalAveragePooling1D(name="global_avg_pool")(x)
     pooled = layers.Concatenate(name="dual_temporal_pooled")([last_step, avg_pool])
 
-    # 4. Three-Layer Deep Classification Head with BatchNorm, GELU, and Dropout
     h = layers.Dense(128, activation='gelu', name="dense_head_1")(pooled)
     h = layers.BatchNormalization(name="bn_1")(h)
     h = layers.Dropout(float(dropout), name="dropout_1")(h)
@@ -132,12 +224,10 @@ def build_tcn_attention_model(
     h = layers.Dense(32, activation='gelu', name="dense_head_3")(h)
     h = layers.Dropout(float(dropout), name="dropout_3")(h)
 
-    # 5. Output Layer: Probability of UP (1) vs DOWN (0)
     outputs = layers.Dense(1, activation='sigmoid', name="direction_probability")(h)
 
     model = Model(inputs=inputs, outputs=outputs, name="PSO_TCN_Attention_Classifier")
 
-    # Optimizer with decoupled weight decay (AdamW)
     optimizer = tf.keras.optimizers.AdamW(
         learning_rate=float(learning_rate),
         weight_decay=float(weight_decay)
@@ -156,9 +246,9 @@ def build_tcn_attention_model(
 
     return model
 
-def get_early_stopping(patience=25, monitor='val_auc', mode='max', verbose=0):
+def get_early_stopping(patience=20, monitor='val_loss', mode='min', verbose=0):
     """
-    Returns EarlyStopping callback with weight restoration based on AUC.
+    Returns EarlyStopping callback with weight restoration.
     """
     return EarlyStopping(
         monitor=monitor,
@@ -168,9 +258,9 @@ def get_early_stopping(patience=25, monitor='val_auc', mode='max', verbose=0):
         verbose=verbose
     )
 
-def get_reduce_lr(monitor='val_auc', factor=0.5, patience=10, min_lr=1e-6, mode='max', verbose=0):
+def get_reduce_lr(monitor='val_loss', factor=0.5, patience=10, min_lr=1e-6, mode='min', verbose=0):
     """
-    Returns ReduceLROnPlateau callback to reduce learning rate when AUC plateaus.
+    Returns ReduceLROnPlateau callback to reduce learning rate when monitored metric plateaus.
     """
     return tf.keras.callbacks.ReduceLROnPlateau(
         monitor=monitor,
@@ -181,6 +271,42 @@ def get_reduce_lr(monitor='val_auc', factor=0.5, patience=10, min_lr=1e-6, mode=
         verbose=verbose
     )
 
+def compute_regression_metrics(y_true, y_pred):
+    """
+    Computes comprehensive continuous return regression and directional metrics.
+    """
+    y_true = np.asarray(y_true, dtype=np.float64).ravel()
+    y_pred = np.asarray(y_pred, dtype=np.float64).ravel()
+
+    mse = float(mean_squared_error(y_true, y_pred))
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    
+    # R2 Score (coefficient of determination)
+    r2 = float(r2_score(y_true, y_pred))
+    evs = float(explained_variance_score(y_true, y_pred))
+
+    # Directional Accuracy: Percentage where sign(predicted) matches sign(actual)
+    actual_direction = (y_true > 0).astype(int)
+    predicted_direction = (y_pred > 0).astype(int)
+    da = float(accuracy_score(actual_direction, predicted_direction)) * 100.0
+
+    # Pearson Correlation between actual and predicted returns
+    if np.std(y_true) > 1e-9 and np.std(y_pred) > 1e-9:
+        corr = float(np.corrcoef(y_true, y_pred)[0, 1])
+    else:
+        corr = 0.0
+
+    return {
+        "rmse": rmse,
+        "mae": mae,
+        "mse": mse,
+        "r2": r2,
+        "explained_variance": evs,
+        "directional_accuracy": da,
+        "pearson_corr": corr
+    }
+
 def compute_classification_metrics(y_true, y_prob, threshold=0.5):
     """
     Computes comprehensive binary classification metrics.
@@ -190,13 +316,7 @@ def compute_classification_metrics(y_true, y_prob, threshold=0.5):
     y_pred = (y_prob >= threshold).astype(int)
 
     acc = accuracy_score(y_true, y_pred)
-    
-    # Handle single class edge case in ROC-AUC
-    if len(np.unique(y_true)) > 1:
-        auc = roc_auc_score(y_true, y_prob)
-    else:
-        auc = 0.5
-
+    auc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.5
     prec = precision_score(y_true, y_pred, zero_division=0)
     rec = recall_score(y_true, y_pred, zero_division=0)
     f1 = f1_score(y_true, y_pred, zero_division=0)
@@ -204,10 +324,7 @@ def compute_classification_metrics(y_true, y_prob, threshold=0.5):
     loss = log_loss(y_true, np.clip(y_prob, 1e-7, 1 - 1e-7))
     cm = confusion_matrix(y_true, y_pred)
 
-    # Confidence calculation: distance from calibrated decision boundary
-    confidence = np.abs(y_prob - threshold) * 2.0  # Range [0.0, 1.0]
-    
-    # High confidence subset metrics (conviction margin >= 0.04 from decision boundary)
+    confidence = np.abs(y_prob - threshold) * 2.0
     high_conf_mask = np.abs(y_prob - threshold) >= 0.04
     if np.sum(high_conf_mask) > 0:
         high_conf_acc = accuracy_score(y_true[high_conf_mask], y_pred[high_conf_mask])
@@ -230,29 +347,68 @@ def compute_classification_metrics(y_true, y_prob, threshold=0.5):
         "high_conf_coverage": high_conf_coverage
     }
 
+def backtest_return_strategy(actual_returns, predicted_returns, threshold=0.0, fee=0.0005):
+    """
+    Simulates a long-or-cash quantitative trading strategy based on continuous predicted log returns.
+    - Long when predicted return > threshold (positive expected gain), Cash (0) otherwise.
+    - Applies transaction fee on position transitions.
+    """
+    actual_returns = np.asarray(actual_returns, dtype=np.float64).ravel()
+    predicted_returns = np.asarray(predicted_returns, dtype=np.float64).ravel()
+
+    # Position signal: 1 for Long, 0 for Cash
+    signals = (predicted_returns > threshold).astype(int)
+
+    # Strategy simple returns: convert actual log return to simple return or multiply directly
+    actual_simple_returns = np.expm1(actual_returns) if np.all(np.abs(actual_returns) < 1.0) else actual_returns
+    strategy_returns = signals * actual_simple_returns
+
+    # Deduct transaction fee on trade switches
+    position_changes = np.abs(np.diff(signals, prepend=signals[0]))
+    strategy_returns -= position_changes * fee
+
+    # Cumulative wealth
+    cum_market = np.cumprod(1.0 + actual_simple_returns) - 1.0
+    cum_strategy = np.cumprod(1.0 + strategy_returns) - 1.0
+
+    # Annualized Sharpe Ratio (assuming 365 crypto days)
+    mean_strat = np.mean(strategy_returns)
+    std_strat = np.std(strategy_returns) + 1e-9
+    sharpe = float((mean_strat / std_strat) * np.sqrt(365))
+
+    # Maximum Drawdown
+    wealth_index = np.cumprod(1.0 + strategy_returns)
+    running_max = np.maximum.accumulate(wealth_index)
+    drawdowns = (wealth_index - running_max) / running_max
+    max_drawdown = float(np.min(drawdowns)) * 100.0 if len(drawdowns) > 0 else 0.0
+
+    return {
+        "cumulative_market": cum_market,
+        "cumulative_strategy": cum_strategy,
+        "total_strategy_return": float(cum_strategy[-1] * 100.0) if len(cum_strategy) > 0 else 0.0,
+        "total_market_return": float(cum_market[-1] * 100.0) if len(cum_market) > 0 else 0.0,
+        "sharpe_ratio": sharpe,
+        "max_drawdown": max_drawdown,
+        "signals": signals
+    }
+
 def backtest_directional_strategy(actual_returns, y_prob, threshold=0.5, fee=0.0005):
     """
-    Simulates a long-or-cash trading strategy based on model directional probability.
-    - Long when y_prob >= threshold, Cash (0 return) otherwise.
-    - Applies transaction fee on position switches.
+    Simulates a long-or-cash trading strategy based on directional probability.
     """
     actual_returns = np.asarray(actual_returns).ravel()
     y_prob = np.asarray(y_prob).ravel()
 
     signals = (y_prob >= threshold).astype(int)
-    
-    # Strategy returns: when signal is 1, earn actual_returns; otherwise 0
-    strategy_returns = signals * actual_returns
+    actual_simple_returns = np.expm1(actual_returns) if np.all(np.abs(actual_returns) < 1.0) else actual_returns
+    strategy_returns = signals * actual_simple_returns
 
-    # Subtract transaction fees on position changes
     position_changes = np.abs(np.diff(signals, prepend=signals[0]))
     strategy_returns -= position_changes * fee
 
-    # Cumulative returns
-    cum_market = np.cumprod(1.0 + actual_returns) - 1.0
+    cum_market = np.cumprod(1.0 + actual_simple_returns) - 1.0
     cum_strategy = np.cumprod(1.0 + strategy_returns) - 1.0
 
-    # Sharpe ratio (assuming 365 trading days for crypto, 0% risk-free rate)
     mean_strat = np.mean(strategy_returns)
     std_strat = np.std(strategy_returns) + 1e-9
     sharpe = (mean_strat / std_strat) * np.sqrt(365)
