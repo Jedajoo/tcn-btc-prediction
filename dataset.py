@@ -282,6 +282,7 @@ plt.close()
 
 df['Next_Adj_Close'] = close_s.shift(-1)
 df['Next_Log_Return'] = np.log(df['Next_Adj_Close'] / close_s + 1e-9).fillna(0.0)
+df['Next_Direction'] = (df['Next_Log_Return'] > 0).astype(int)
 
 df = df.dropna()
 
@@ -430,7 +431,7 @@ n_features_to_select = 15
 print(f"\n--- Running mRMR Feature Selection (Selecting Top {n_features_to_select} of {len(feature_cols)} features) ---")
 selected_indices, selected_features, selection_history = mrmr_feature_selection(
     X=train_features_scaled,
-    y=train_df['Next_Log_Return'].values,
+    y=train_df['Next_Direction'].values,
     feature_names=feature_cols,
     n_features_to_select=n_features_to_select,
     method="MID",
@@ -480,7 +481,7 @@ def create_sequences_from_arrays(features, target, window):
 # For training sequences
 X_train, y_train = create_sequences_from_arrays(
     train_features_scaled,
-    train_df['Next_Log_Return'].values,
+    train_df['Next_Direction'].values,
     time_window
 )
 
@@ -490,8 +491,8 @@ test_input_features = np.vstack([
     test_features_scaled
 ])
 test_input_target = np.concatenate([
-    train_df['Next_Log_Return'].values[-time_window+1:],
-    test_df['Next_Log_Return'].values
+    train_df['Next_Direction'].values[-time_window+1:],
+    test_df['Next_Direction'].values
 ])
 
 X_test, y_test = create_sequences_from_arrays(
@@ -514,7 +515,7 @@ np.savez(
     target=(train_df['Next_Adj_Close'].values > train_df['Adj Close'].values).astype(int),
     prices=train_df['Adj Close'].values,
     next_prices=train_df['Next_Adj_Close'].values,
-    returns=train_df['Next_Log_Return'].values,
+    returns=train_df['Next_Direction'].values,
     dates=train_df.index.astype(str).values
 )
 np.savez(
@@ -523,7 +524,7 @@ np.savez(
     target=(test_df['Next_Adj_Close'].values > test_df['Adj Close'].values).astype(int),
     prices=test_df['Adj Close'].values,
     next_prices=test_df['Next_Adj_Close'].values,
-    returns=test_df['Next_Log_Return'].values,
+    returns=df['Next_Direction'].values,
     dates=test_df.index.astype(str).values
 )
 

@@ -492,7 +492,7 @@ def run_final_ensemble():
 
         if os.path.exists(seed_model_path) and os.path.exists(seed_history_path):
             print(f"Loading existing trained model for Seed {seed}...")
-            model = tf.keras.models.load_model(seed_model_path, compile=False)
+            model = tf.keras.models.load_model(seed_model_path, compile=False, safe_mode=False)
             with open(seed_history_path, "rb") as f:
                 history = pickle.load(f)
         else:
@@ -511,14 +511,14 @@ def run_final_ensemble():
                 dilations=best_hp.get("dilations", DEFAULT_DILATIONS)
             )
 
-            early_stopping = ut.get_early_stopping(patience=20, monitor='val_loss', mode='min', verbose=1)
+            early_stopping = ut.get_early_stopping(patience=70, monitor='val_loss', mode='min', verbose=1)
             reduce_lr = ut.get_reduce_lr(monitor='val_loss', factor=0.5, patience=10, mode='min', verbose=0)
 
             history_obj = model.fit(
                 X_tr_final,
                 y_tr_final,
                 validation_data=(X_val_final, y_val_final),
-                epochs=100,
+                epochs=200,
                 batch_size=best_hp["batch_size"],
                 shuffle=False,
                 callbacks=[early_stopping, reduce_lr],
