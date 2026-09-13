@@ -176,7 +176,8 @@ def load_tabular_data():
 
 def precache_sequence_data(train_features, train_target):
     import utils as ut
-    X_all, y_all = ut.create_sequences(train_features, train_target, FIXED_TIME_WINDOW)
+    train_mean_drift = float(np.mean(train_target))
+    X_all, y_all = ut.create_sequences(train_features, train_target - train_mean_drift, FIXED_TIME_WINDOW)
     val_size = max(1, int(len(X_all) * 0.20))
     return {
         FIXED_TIME_WINDOW: {
@@ -468,7 +469,11 @@ def run_final_ensemble():
     )
 
     best_window = best_hp["time_window"]
-    X_train_final, y_train_final = ut.create_sequences(train_features, train_target, best_window)
+    train_mean_drift = float(np.mean(train_target))
+    print(f"Historical Train Mean Daily Return (Drift): {train_mean_drift:.6f} ({train_mean_drift*100:.3f}%/day)")
+    train_target_demeaned = train_target - train_mean_drift
+
+    X_train_final, y_train_final = ut.create_sequences(train_features, train_target_demeaned, best_window)
     val_size = max(1, int(len(X_train_final) * 0.20))
     X_tr_final, y_tr_final = X_train_final[:-val_size], y_train_final[:-val_size]
     X_val_final, y_val_final = X_train_final[-val_size:], y_train_final[-val_size:]
@@ -536,11 +541,11 @@ def run_final_ensemble():
             with open(seed_history_path, "wb") as f:
                 pickle.dump(history, f)
 
-        # Predict on validation and test sets
-        val_pred = model.predict(X_val_final, verbose=0).ravel()
+        # Predict on validation and test sets (adding back drift to evaluate real returns)
+        val_pred = model.predict(X_val_final, verbose=0).ravel() + train_mean_drift
         val_individual_predictions.append(val_pred)
 
-        pred = model.predict(X_test_final, verbose=0).ravel()
+        pred = model.predict(X_test_final, verbose=0).ravel() + train_mean_drift
         individual_predictions.append(pred)
 
         seed_metrics = ut.compute_regression_metrics(y_test_final, pred)
@@ -591,7 +596,8 @@ def run_final_ensemble():
         "ensemble_metrics": ensemble_metrics,
         "backtest_results": backtest_res,
         "best_hyperparameters": best_hp,
-        "seed_val_rmses": seed_val_rmses
+        "seed_val_rmses": seed_val_rmses,
+        "train_mean_drift": train_mean_drift
     }
     dump(evaluation_summary, "output/model/ensemble_evaluation.joblib")
     dump(best_hp, "output/model/best_hyperparameters.joblib")

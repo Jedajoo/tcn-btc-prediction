@@ -147,15 +147,15 @@ def build_hybrid_tcn_gru_model(
     h = layers.Dense(32, activation='gelu', name="dense_head_3")(h)
     h = layers.Dropout(float(dropout), name="dropout_3")(h)
 
-    # 6. Scaled Tanh Output Layer (Bounded to +/- 4% daily return with zero-centric initialization)
+    # 6. Scaled Tanh Output Layer (Bounded to +/- 6% daily return with active initialization)
     h_out = layers.Dense(
         1,
         activation='tanh',
-        kernel_initializer='zeros',
+        kernel_initializer=tf.keras.initializers.TruncatedNormal(stddev=0.10),
         bias_initializer='zeros',
         name="tanh_core"
     )(h)
-    outputs = layers.Lambda(lambda t: t * 0.04, name="predicted_log_return")(h_out)
+    outputs = layers.Lambda(lambda t: t * 0.06, name="predicted_log_return")(h_out)
 
     model = Model(inputs=inputs, outputs=outputs, name="Hybrid_TCN_GRU_Regressor")
 
