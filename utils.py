@@ -136,12 +136,16 @@ def build_hybrid_tcn_gru_model(
     pooled = layers.Concatenate(name="dual_temporal_pooled")([last_step, avg_pool])
 
     # 5. Deep Regression Head
-    h = layers.Dense(32, activation='gelu', name="dense_head_1")(pooled)
+    h = layers.Dense(128, activation='gelu', name="dense_head_1")(pooled)
     h = layers.BatchNormalization(name="bn_1")(h)
     h = layers.Dropout(float(dropout), name="dropout_1")(h)
 
-    h = layers.Dense(16, activation='gelu', name="dense_head_2")(h)
+    h = layers.Dense(64, activation='gelu', name="dense_head_2")(h)
+    h = layers.BatchNormalization(name="bn_2")(h)
     h = layers.Dropout(float(dropout), name="dropout_2")(h)
+
+    h = layers.Dense(32, activation='gelu', name="dense_head_3")(h)
+    h = layers.Dropout(float(dropout), name="dropout_3")(h)
 
     # 6. Linear Output Layer (Next-Day Log Return)
     outputs = layers.Dense(1, activation='linear', name="predicted_log_return")(h)
@@ -155,8 +159,7 @@ def build_hybrid_tcn_gru_model(
     )
 
     # Huber loss tuned for crypto return scale (delta=0.01 protects against flash crashes)
-    loss_fn = tf.keras.losses.Huber(delta=0.01)
-
+    loss_fn = tf.keras.losses.MeanSquaredError
     model.compile(
         optimizer=optimizer,
         loss=loss_fn,

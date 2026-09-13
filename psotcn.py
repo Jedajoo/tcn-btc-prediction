@@ -517,7 +517,7 @@ def run_final_ensemble():
                 dilations=best_hp.get("dilations", DEFAULT_DILATIONS)
             )
 
-            early_stopping = ut.get_early_stopping(patience=70, monitor='val_loss', mode='min', verbose=1)
+            early_stopping = ut.get_early_stopping(patience=20, monitor='val_loss', mode='min', verbose=1)
             reduce_lr = ut.get_reduce_lr(monitor='val_loss', factor=0.5, patience=10, mode='min', verbose=0)
 
             history_obj = model.fit(
