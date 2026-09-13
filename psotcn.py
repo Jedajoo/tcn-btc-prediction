@@ -9,6 +9,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from joblib import dump, load
 
+try:
+    import keras
+    keras.config.enable_unsafe_deserialization()
+except Exception:
+    pass
+
 # Global Constants & Hyperparameter Constraints
 ticker = "BTC-USD"
 FIXED_TIME_WINDOW = 60

@@ -291,9 +291,8 @@ print(f"\nDataset shape after indicator calculations: {df.shape}")
 # Save full processed tabular dataset
 df.to_csv('output/data/dataset.csv', index=True)
 
-# Feature columns list
+# Feature columns list (STRICTLY STATIONARY & SCALE-INVARIANT INDICATORS)
 feature_cols = [
-    'Adj Close', 'High', 'Low', 'Open', 'Volume',
     'Log_Return_1', 'Log_Return_3', 'Log_Return_5', 'Log_Return_10',
     'High_Low_Ratio', 'Close_Open_Ratio',
     'Dist_SMA10', 'Dist_SMA25', 'Dist_SMA50',
@@ -431,7 +430,7 @@ n_features_to_select = 15
 print(f"\n--- Running mRMR Feature Selection (Selecting Top {n_features_to_select} of {len(feature_cols)} features) ---")
 selected_indices, selected_features, selection_history = mrmr_feature_selection(
     X=train_features_scaled,
-    y=train_df['Next_Direction'].values,
+    y=train_df['Next_Log_Return'].values,
     feature_names=feature_cols,
     n_features_to_select=n_features_to_select,
     method="MID",
@@ -481,7 +480,7 @@ def create_sequences_from_arrays(features, target, window):
 # For training sequences
 X_train, y_train = create_sequences_from_arrays(
     train_features_scaled,
-    train_df['Next_Direction'].values,
+    train_df['Next_Log_Return'].values,
     time_window
 )
 
@@ -491,8 +490,8 @@ test_input_features = np.vstack([
     test_features_scaled
 ])
 test_input_target = np.concatenate([
-    train_df['Next_Direction'].values[-time_window+1:],
-    test_df['Next_Direction'].values
+    train_df['Next_Log_Return'].values[-time_window+1:],
+    test_df['Next_Log_Return'].values
 ])
 
 X_test, y_test = create_sequences_from_arrays(
@@ -512,19 +511,19 @@ np.savez("output/data/test_data.npz", X=X_test, y=y_test)
 np.savez(
     "output/data/train_tabular.npz",
     features=train_features_scaled,
-    target=(train_df['Next_Adj_Close'].values > train_df['Adj Close'].values).astype(int),
+    target=train_df['Next_Log_Return'].values,
     prices=train_df['Adj Close'].values,
     next_prices=train_df['Next_Adj_Close'].values,
-    returns=train_df['Next_Direction'].values,
+    returns=train_df['Next_Log_Return'].values,
     dates=train_df.index.astype(str).values
 )
 np.savez(
     "output/data/test_tabular.npz",
     features=test_features_scaled,
-    target=(test_df['Next_Adj_Close'].values > test_df['Adj Close'].values).astype(int),
+    target=test_df['Next_Log_Return'].values,
     prices=test_df['Adj Close'].values,
     next_prices=test_df['Next_Adj_Close'].values,
-    returns=df['Next_Direction'].values,
+    returns=test_df['Next_Log_Return'].values,
     dates=test_df.index.astype(str).values
 )
 

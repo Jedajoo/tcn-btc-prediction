@@ -96,8 +96,6 @@ def build_hybrid_tcn_gru_model(
 
     inputs = layers.Input(shape=input_shape, name="input_sequence")
 
-    x = layers.GaussianNoise(0.01)(inputs)
-
     # 1. Temporal Convolutional Network (TCN)
     tcn_out = TCN(
         nb_filters=int(n_filters),
@@ -145,8 +143,8 @@ def build_hybrid_tcn_gru_model(
     h = layers.Dense(16, activation='gelu', name="dense_head_2")(h)
     h = layers.Dropout(float(dropout), name="dropout_2")(h)
 
-    # 6. Linear Output Layer (directional)
-    outputs = layers.Dense(1, activation='sigmoid', name="direction_probability")(h)
+    # 6. Linear Output Layer (Next-Day Log Return)
+    outputs = layers.Dense(1, activation='linear', name="predicted_log_return")(h)
 
     model = Model(inputs=inputs, outputs=outputs, name="Hybrid_TCN_GRU_Regressor")
 
@@ -156,8 +154,8 @@ def build_hybrid_tcn_gru_model(
         weight_decay=float(weight_decay)
     )
 
-    # Huber loss is robust to crypto return outliers and heavy-tailed shocks
-    loss_fn = tf.keras.losses.BinaryCrossentropy(label_smoothing=0.03)
+    # Huber loss tuned for crypto return scale (delta=0.01 protects against flash crashes)
+    loss_fn = tf.keras.losses.Huber(delta=0.01)
 
     model.compile(
         optimizer=optimizer,
