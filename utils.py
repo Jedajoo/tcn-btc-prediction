@@ -147,8 +147,15 @@ def build_hybrid_tcn_gru_model(
     h = layers.Dense(32, activation='gelu', name="dense_head_3")(h)
     h = layers.Dropout(float(dropout), name="dropout_3")(h)
 
-    # 6. Linear Output Layer (Next-Day Log Return)
-    outputs = layers.Dense(1, activation='linear', name="predicted_log_return")(h)
+    # 6. Scaled Tanh Output Layer (Bounded to +/- 4% daily return with zero-centric initialization)
+    h_out = layers.Dense(
+        1,
+        activation='tanh',
+        kernel_initializer='zeros',
+        bias_initializer='zeros',
+        name="tanh_core"
+    )(h)
+    outputs = layers.Lambda(lambda t: t * 0.04, name="predicted_log_return")(h_out)
 
     model = Model(inputs=inputs, outputs=outputs, name="Hybrid_TCN_GRU_Regressor")
 
@@ -159,7 +166,7 @@ def build_hybrid_tcn_gru_model(
     )
 
     # Huber loss tuned for crypto return scale (delta=0.01 protects against flash crashes)
-    loss_fn = tf.keras.losses.MeanSquaredError
+    loss_fn = tf.keras.losses.MeanSquaredError(name='mse')
     model.compile(
         optimizer=optimizer,
         loss=loss_fn,
