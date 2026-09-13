@@ -14,7 +14,8 @@ os.makedirs('output/plots', exist_ok=True)
 os.makedirs('output/model', exist_ok=True)
 os.makedirs('checkpoints/seeds', exist_ok=True)
 
-ticker = 'BTC-USD'
+ticker1 = 'BTC-USD'
+ticker2 = 'ETH-USD'
 start_date = '2020-01-01'
 end_date = '2026-01-01'
 time_window = 60  # Default sequence window
@@ -414,8 +415,8 @@ def mrmr_feature_selection(
 # 3. TRAIN / TEST SPLIT & ROBUST SCALING
 # ==========================================
 
-train_df = download_data('btc-usd', start_date, end_date, time_window)
-test_df = download_data('eth-usd', start_date, end_date, time_window)
+train_df = download_data(ticker1, start_date, end_date, time_window)
+test_df = download_data(ticker2, start_date, end_date, time_window)
 
 print(f"Training set: {len(train_df)} rows ({train_df.index[0].date()} to {train_df.index[-1].date()})")
 print(f"Testing set : {len(test_df)} rows ({test_df.index[0].date()} to {test_df.index[-1].date()})")
