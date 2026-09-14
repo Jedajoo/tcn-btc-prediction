@@ -118,7 +118,7 @@ def build_hybrid_tcn_gru_model(
     )(tcn_out)
 
     # 3. Multi-Head Temporal Self-Attention over sequential representations
-    num_heads = 2
+    num_heads = 4
     key_dim = max(16, int(gru_units // num_heads))
     attn_out = layers.MultiHeadAttention(
         num_heads=num_heads,
@@ -135,29 +135,22 @@ def build_hybrid_tcn_gru_model(
     avg_pool = layers.GlobalAveragePooling1D(name="global_avg_pool")(x)
     pooled = layers.Concatenate(name="dual_temporal_pooled")([last_step, avg_pool])
 
-    # 5. Deep Regression Head
-    h = layers.Dense(128, activation='gelu', name="dense_head_1")(pooled)
+    # 5. Deep Classification Head with Tanh activations
+    h = layers.Dense(128, activation='tanh', name="dense_head_1")(pooled)
     h = layers.BatchNormalization(name="bn_1")(h)
     h = layers.Dropout(float(dropout), name="dropout_1")(h)
 
-    h = layers.Dense(64, activation='gelu', name="dense_head_2")(h)
+    h = layers.Dense(64, activation='tanh', name="dense_head_2")(h)
     h = layers.BatchNormalization(name="bn_2")(h)
     h = layers.Dropout(float(dropout), name="dropout_2")(h)
 
-    h = layers.Dense(32, activation='gelu', name="dense_head_3")(h)
+    h = layers.Dense(32, activation='tanh', name="dense_head_3")(h)
     h = layers.Dropout(float(dropout), name="dropout_3")(h)
 
-    # 6. Scaled Tanh Output Layer (Bounded to +/- 6% daily return with active initialization)
-    h_out = layers.Dense(
-        1,
-        activation='tanh',
-        kernel_initializer=tf.keras.initializers.TruncatedNormal(stddev=0.10),
-        bias_initializer='zeros',
-        name="tanh_core"
-    )(h)
-    outputs = layers.Lambda(lambda t: t * 0.06, name="predicted_log_return")(h_out)
+    # 6. Output Layer with Sigmoid Activation for Directional Prediction
+    outputs = layers.Dense(1, activation='sigmoid', name="direction_probability")(h)
 
-    model = Model(inputs=inputs, outputs=outputs, name="Hybrid_TCN_GRU_Regressor")
+    model = Model(inputs=inputs, outputs=outputs, name="Hybrid_TCN_GRU_Classifier")
 
     # Optimizer with decoupled weight decay (AdamW)
     optimizer = tf.keras.optimizers.AdamW(
@@ -165,15 +158,14 @@ def build_hybrid_tcn_gru_model(
         weight_decay=float(weight_decay)
     )
 
-    # Huber loss tuned for crypto return scale (delta=0.01 protects against flash crashes)
-    loss_fn = tf.keras.losses.MeanSquaredError(name='mse')
+    # Binary cross entropy loss for directional classification
+    loss_fn = tf.keras.losses.BinaryCrossentropy(name='binary_crossentropy')
     model.compile(
         optimizer=optimizer,
         loss=loss_fn,
         metrics=[
-            'mae',
-            'mse',
-            tf.keras.metrics.RootMeanSquaredError(name='rmse')
+            'accuracy',
+            tf.keras.metrics.AUC(name='auc')
         ]
     )
 
@@ -208,7 +200,7 @@ def build_tcn_attention_model(
         name="tcn_layer"
     )(inputs)
 
-    num_heads = 2
+    num_heads = 4
     key_dim = max(16, int(n_filters // num_heads))
     attn_out = layers.MultiHeadAttention(
         num_heads=num_heads,
@@ -223,15 +215,15 @@ def build_tcn_attention_model(
     avg_pool = layers.GlobalAveragePooling1D(name="global_avg_pool")(x)
     pooled = layers.Concatenate(name="dual_temporal_pooled")([last_step, avg_pool])
 
-    h = layers.Dense(128, activation='gelu', name="dense_head_1")(pooled)
+    h = layers.Dense(128, activation='tanh', name="dense_head_1")(pooled)
     h = layers.BatchNormalization(name="bn_1")(h)
     h = layers.Dropout(float(dropout), name="dropout_1")(h)
 
-    h = layers.Dense(64, activation='gelu', name="dense_head_2")(h)
+    h = layers.Dense(64, activation='tanh', name="dense_head_2")(h)
     h = layers.BatchNormalization(name="bn_2")(h)
     h = layers.Dropout(float(dropout), name="dropout_2")(h)
 
-    h = layers.Dense(32, activation='gelu', name="dense_head_3")(h)
+    h = layers.Dense(32, activation='tanh', name="dense_head_3")(h)
     h = layers.Dropout(float(dropout), name="dropout_3")(h)
 
     outputs = layers.Dense(1, activation='sigmoid', name="direction_probability")(h)
@@ -243,7 +235,7 @@ def build_tcn_attention_model(
         weight_decay=float(weight_decay)
     )
 
-    loss_fn = get_focal_loss(gamma=2.0, alpha=0.50, label_smoothing=0.05)
+    loss_fn = tf.keras.losses.BinaryCrossentropy(name='binary_crossentropy')
 
     model.compile(
         optimizer=optimizer,

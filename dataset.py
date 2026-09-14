@@ -3,7 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import RobustScaler
-from sklearn.feature_selection import mutual_info_regression
+from sklearn.feature_selection import mutual_info_regression, mutual_info_classif
 import matplotlib.pyplot as plt
 from joblib import dump
 
@@ -18,7 +18,7 @@ ticker1 = 'BTC-USD'
 ticker2 = 'ETH-USD'
 start_date = '2020-01-01'
 end_date = '2026-01-01'
-time_window = 60  # Default sequence window
+time_window = 90  # Default sequence window (90 days)
 
 def download_data(ticker, start_date, end_date, time_window):
     print(f"Downloading historical data for {ticker} from {start_date} to {end_date}...")
@@ -284,6 +284,7 @@ def download_data(ticker, start_date, end_date, time_window):
 
     df['Next_Adj_Close'] = close_s.shift(-1)
     df['Next_Log_Return'] = np.log(df['Next_Adj_Close'] / close_s + 1e-9).fillna(0.0)
+    df['Target_Direction'] = (df['Next_Adj_Close'] > close_s).astype(int)
 
     df = df.dropna()
 
@@ -348,8 +349,11 @@ def mrmr_feature_selection(
     n_samples, n_features = X.shape
     k = min(n_features_to_select, n_features)
 
-    # 1. Relevance: I(f_i; Y) using scikit-learn mutual_info_regression
-    relevance = mutual_info_regression(X, y, random_state=random_state)
+    # 1. Relevance: I(f_i; Y) using scikit-learn mutual_info_classif for directional classification
+    if len(np.unique(y)) <= 2:
+        relevance = mutual_info_classif(X, y, random_state=random_state)
+    else:
+        relevance = mutual_info_regression(X, y, random_state=random_state)
 
     # 2. Redundancy: Pairwise Pearson correlation matrix among scaled features
     corr_matrix = np.abs(np.corrcoef(X, rowvar=False))
@@ -430,10 +434,10 @@ test_features_scaled = scaler.fit_transform(test_df[feature_cols])
 # 4. mRMR FEATURE SELECTION (AFTER SCALING)
 # ==========================================
 n_features_to_select = 15
-print(f"\n--- Running mRMR Feature Selection (Selecting Top {n_features_to_select} of {len(feature_cols)} features) ---")
+print(f"\n--- Running mRMR Feature Selection (Selecting Top {n_features_to_select} of {len(feature_cols)} features for Directional Target) ---")
 selected_indices, selected_features, selection_history = mrmr_feature_selection(
     X=train_features_scaled,
-    y=train_df['Next_Log_Return'].values,
+    y=train_df['Target_Direction'].values,
     feature_names=feature_cols,
     n_features_to_select=n_features_to_select,
     method="MID",
@@ -471,7 +475,7 @@ plt.close()
 print("Saved mRMR selection plot to output/data/plots/mrmr_feature_selection.png")
 
 # ==========================================
-# 5. DEFAULT SEQUENCE GENERATION (WINDOW=60)
+# 5. DEFAULT SEQUENCE GENERATION (WINDOW=90)
 # ==========================================
 def create_sequences_from_arrays(features, target, window):
     X, y = [], []
@@ -480,10 +484,10 @@ def create_sequences_from_arrays(features, target, window):
         y.append(target[i + window - 1])
     return np.array(X), np.array(y)
 
-# For training sequences
+# For training sequences (Directional Target: 0 or 1)
 X_train, y_train = create_sequences_from_arrays(
     train_features_scaled,
-    train_df['Next_Log_Return'].values,
+    train_df['Target_Direction'].values,
     time_window
 )
 
@@ -493,8 +497,8 @@ test_input_features = np.vstack([
     test_features_scaled
 ])
 test_input_target = np.concatenate([
-    train_df['Next_Log_Return'].values[-time_window+1:],
-    test_df['Next_Log_Return'].values
+    train_df['Target_Direction'].values[-time_window+1:],
+    test_df['Target_Direction'].values
 ])
 
 X_test, y_test = create_sequences_from_arrays(
@@ -514,7 +518,7 @@ np.savez("output/data/test_data.npz", X=X_test, y=y_test)
 np.savez(
     "output/data/train_tabular.npz",
     features=train_features_scaled,
-    target=train_df['Next_Log_Return'].values,
+    target=train_df['Target_Direction'].values,
     prices=train_df['Adj Close'].values,
     next_prices=train_df['Next_Adj_Close'].values,
     returns=train_df['Next_Log_Return'].values,
@@ -523,7 +527,7 @@ np.savez(
 np.savez(
     "output/data/test_tabular.npz",
     features=test_features_scaled,
-    target=test_df['Next_Log_Return'].values,
+    target=test_df['Target_Direction'].values,
     prices=test_df['Adj Close'].values,
     next_prices=test_df['Next_Adj_Close'].values,
     returns=test_df['Next_Log_Return'].values,

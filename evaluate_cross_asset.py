@@ -167,19 +167,16 @@ def main():
     btc_scaler = load(scaler_path)
     selected_features = load(cols_path)
     best_hp = load(hp_path)
-    time_window = best_hp["time_window"]
-
-    # Retrieve BTC training drift
-    train_mean_drift = 0.00151174
+    time_window = best_hp.get("time_window", 90)
+    optimal_thresh = float(best_hp.get("optimal_threshold", 0.50))
     btc_summary = None
     if os.path.exists(btc_eval_path):
         btc_summary = load(btc_eval_path)
-        train_mean_drift = btc_summary.get("train_mean_drift", train_mean_drift)
 
     print(f"Loaded BTC Scaler with {len(selected_features)} mRMR features.")
     print(f"Selected features: {selected_features}")
     print(f"Optimal Window = {time_window}, Filters = {best_hp['n_filters']}, GRU = {best_hp['gru_units']}")
-    print(f"BTC Historical Drift: {train_mean_drift:.6f} ({train_mean_drift*100:.3f}%/day)")
+    print(f"BTC Calibrated Threshold: {optimal_thresh:.4f}")
 
     # 2. Check for Trained Seed Models
     seed_list = [42, 43, 44, 45, 46]
@@ -222,10 +219,12 @@ def main():
     eth_features_scaled = btc_scaler.transform(full_eval_df[selected_features])
     eth_returns = full_eval_df['Next_Log_Return'].values
     eth_prices = full_eval_df['Adj Close'].values
+    eth_target = (full_eval_df['Next_Adj_Close'] > full_eval_df['Adj Close']).astype(int).values
 
     # 6. Create Sequences
-    X_eth, y_eth = ut.create_sequences(eth_features_scaled, eth_returns, time_window)
+    X_eth, y_eth = ut.create_sequences(eth_features_scaled, eth_target, time_window)
     eval_prices = eth_prices[-len(y_eth):]
+    eval_returns = eth_returns[-len(y_eth):]
     print(f"Created {len(X_eth)} sequence samples of shape {X_eth.shape}")
 
     # 7. Multi-Seed Ensemble Inference
@@ -238,39 +237,35 @@ def main():
         print(f"Loading Seed {seed} from {model_path}...")
         model = tf.keras.models.load_model(model_path, compile=False, safe_mode=False)
 
-        pred_demeaned = model.predict(X_eth, verbose=0).ravel()
-        # Add back drift to evaluate real return scale
-        pred = pred_demeaned + train_mean_drift
+        pred = model.predict(X_eth, verbose=0).ravel()
         individual_predictions.append(pred)
 
-        sm = ut.compute_regression_metrics(y_eth, pred)
+        sm = ut.compute_classification_metrics(y_eth, pred, threshold=optimal_thresh)
         seed_metrics_list.append(sm)
-        neg_count = np.sum(pred < 0)
-        print(f"  Seed {seed} -> RMSE: {sm['rmse']:.5f} | MAE: {sm['mae']:.5f} | R2: {sm['r2']:.4f} | DA: {sm['directional_accuracy']:.2f}% | Negative Days: {neg_count}/{len(pred)} ({neg_count/len(pred)*100:.1f}%)")
+        up_count = np.sum(pred >= optimal_thresh)
+        print(f"  Seed {seed} -> Acc: {sm['accuracy']*100:.2f}% | AUC: {sm['auc']:.4f} | F1: {sm['f1']:.4f} | Up Days: {up_count}/{len(pred)} ({up_count/len(pred)*100:.1f}%)")
 
         del model
         tf.keras.backend.clear_session()
 
     ensemble_preds = np.mean(individual_predictions, axis=0)
-    ensemble_metrics = ut.compute_regression_metrics(y_eth, ensemble_preds)
+    ensemble_metrics = ut.compute_classification_metrics(y_eth, ensemble_preds, threshold=optimal_thresh)
 
     # 8. Financial Backtest on ETH
-    backtest_res = ut.backtest_return_strategy(y_eth, ensemble_preds, threshold=0.0)
+    backtest_res = ut.backtest_directional_strategy(eval_returns, ensemble_preds, threshold=optimal_thresh)
 
     print("\n" + "=" * 65)
     print(f"CROSS-ASSET PERFORMANCE: BTC-TRAINED MODEL ON {ticker}")
     print("=" * 65)
-    print(f"Ensemble RMSE (Log Return) : {ensemble_metrics['rmse']:.6f}")
-    print(f"Ensemble MAE  (Log Return) : {ensemble_metrics['mae']:.6f}")
-    print(f"Ensemble MSE               : {ensemble_metrics['mse']:.8f}")
-    print(f"Ensemble R2 Score          : {ensemble_metrics['r2']:.4f}")
-    print(f"Directional Accuracy (DA)  : {ensemble_metrics['directional_accuracy']:.2f}%")
-    print(f"Pearson Correlation (r)    : {ensemble_metrics['pearson_corr']:.4f}")
+    print(f"Directional Accuracy (DA)  : {ensemble_metrics['accuracy']*100:.2f}%")
+    print(f"ROC-AUC Score              : {ensemble_metrics['auc']:.4f}")
+    print(f"Precision (Up Class)       : {ensemble_metrics['precision']:.4f}")
+    print(f"Recall (Up Class)          : {ensemble_metrics['recall']:.4f}")
+    print(f"F1 Score                   : {ensemble_metrics['f1']:.4f}")
+    print(f"Brier Score Loss           : {ensemble_metrics['brier_score']:.5f}")
     print(f"Strategy Cumulative Return : {backtest_res['total_strategy_return']:.2f}% (vs {ticker} Buy&Hold: {backtest_res['total_market_return']:.2f}%)")
     print(f"Strategy Sharpe Ratio      : {backtest_res['sharpe_ratio']:.2f}")
-    print(f"Strategy Max Drawdown      : {backtest_res['max_drawdown']:.2f}%")
-    print(f"Total Long Days            : {backtest_res['total_trades_long']} ({backtest_res['long_ratio']*100:.1f}%)")
-    print(f"Total Cash Days            : {backtest_res['total_trades_cash']} ({backtest_res['cash_ratio']*100:.1f}%)")
+    print(f"Confusion Matrix: \n{ensemble_metrics['confusion_matrix']}")
     print("=" * 65 + "\n")
 
     # 9. Comparison against BTC In-Domain Performance
@@ -280,52 +275,47 @@ def main():
         print("--- CROSS-ASSET COMPARISON SUMMARY ---")
         print(f"{'Metric':<25} | {'In-Domain (BTC-USD)':<20} | {'Cross-Asset (' + ticker + ')':<20}")
         print("-" * 71)
-        print(f"{'Directional Accuracy':<25} | {btc_m.get('directional_accuracy', 0):.2f}%{'':<14} | {ensemble_metrics['directional_accuracy']:.2f}%")
+        print(f"{'Directional Accuracy':<25} | {btc_m.get('accuracy', 0)*100:.2f}%{'':<14} | {ensemble_metrics['accuracy']*100:.2f}%")
+        print(f"{'ROC-AUC Score':<25} | {btc_m.get('auc', 0):.4f}{'':<14} | {ensemble_metrics['auc']:.4f}")
+        print(f"{'F1 Score':<25} | {btc_m.get('f1', 0):.4f}{'':<14} | {ensemble_metrics['f1']:.4f}")
         print(f"{'Strategy Return':<25} | {btc_bt.get('total_strategy_return', 0):.2f}% (BH: {btc_bt.get('total_market_return', 0):.2f}%){'':<2} | {backtest_res['total_strategy_return']:.2f}% (BH: {backtest_res['total_market_return']:.2f}%)")
         print(f"{'Strategy Sharpe':<25} | {btc_bt.get('sharpe_ratio', 0):.2f}{'':<16} | {backtest_res['sharpe_ratio']:.2f}")
-        print(f"{'Strategy Max Drawdown':<25} | {btc_bt.get('max_drawdown', 0):.2f}%{'':<13} | {backtest_res['max_drawdown']:.2f}%")
-        print(f"{'Pearson Correlation':<25} | {btc_m.get('pearson_corr', 0):.4f}{'':<14} | {ensemble_metrics['pearson_corr']:.4f}")
-        print(f"{'RMSE':<25} | {btc_m.get('rmse', 0):.5f}{'':<13} | {ensemble_metrics['rmse']:.5f}")
-        print(f"{'R2 Score':<25} | {btc_m.get('r2', 0):.4f}{'':<14} | {ensemble_metrics['r2']:.4f}")
         print("-" * 71 + "\n")
 
     # 10. Generate Visual Plots
     plot_dir = f"output/plots/cross_asset_{ticker.split('-')[0].lower()}"
     os.makedirs(plot_dir, exist_ok=True)
 
-    # Plot A: Actual vs Predicted Return
+    # Plot A: Actual vs Predicted Up Probability
     plt.figure(figsize=(14, 6))
-    plt.plot(y_eth, label=f'Actual {ticker} Log Return', color='black', alpha=0.5, lw=1.2)
-    plt.plot(ensemble_preds, label=f'BTC-Trained Hybrid TCN-GRU Predicted (RMSE={ensemble_metrics["rmse"]:.4f})', color='darkorange', lw=1.5)
-    plt.axhline(0, color='gray', linestyle='--', alpha=0.5)
-    plt.title(f'{ticker} Next-Day Return: Actual vs BTC-Trained Cross-Asset Prediction')
+    plt.scatter(range(len(y_eth)), y_eth, label=f'Actual {ticker} Direction (1=Up, 0=Down)', color='black', alpha=0.3, s=15)
+    plt.plot(ensemble_preds, label=f'BTC-Trained Hybrid TCN-GRU P(Up) (AUC={ensemble_metrics["auc"]:.4f})', color='darkorange', lw=1.5)
+    plt.axhline(optimal_thresh, color='red', linestyle='--', alpha=0.7, label=f'Calibrated Threshold ({optimal_thresh:.3f})')
+    plt.title(f'{ticker} Next-Day Direction: Actual vs BTC-Trained Cross-Asset Probability')
     plt.xlabel('Evaluation Sample Days')
-    plt.ylabel('Log Return')
+    plt.ylabel('P(Up)')
     plt.legend(loc='upper left')
     plt.grid(True, alpha=0.3)
     plt.savefig(os.path.join(plot_dir, f"{ticker}_actual_vs_predicted.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
-    # Plot B: Residual Scatter and Histogram
-    residuals = y_eth - ensemble_preds
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    ax1.scatter(y_eth, ensemble_preds, alpha=0.5, color='coral', s=20)
-    min_v = min(np.min(y_eth), np.min(ensemble_preds))
-    max_v = max(np.max(y_eth), np.max(ensemble_preds))
-    ax1.plot([min_v, max_v], [min_v, max_v], color='black', linestyle='--', label='Identity (Ideal)')
-    ax1.set_title(f'{ticker} Actual vs Predicted Scatter')
-    ax1.set_xlabel(f'Actual {ticker} Return')
-    ax1.set_ylabel(f'Predicted Return')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    ax2.hist(residuals, bins=30, color='sandybrown', edgecolor='black', alpha=0.7)
-    ax2.axvline(0, color='red', linestyle='--', label=f'Mean Error ({np.mean(residuals):.5f})')
-    ax2.set_title(f'{ticker} Prediction Residuals Distribution')
-    ax2.set_xlabel('Residual (Actual - Predicted)')
-    ax2.set_ylabel('Frequency')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    # Plot B: Confusion Matrix
+    cm = ensemble_metrics['confusion_matrix']
+    plt.figure(figsize=(6, 5))
+    im = plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Oranges)
+    plt.title(f'{ticker} Cross-Asset Confusion Matrix')
+    plt.colorbar(im)
+    classes = ['Down (0)', 'Up (1)']
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes)
+    plt.yticks(tick_marks, classes)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(cm[i, j], 'd'),
+                     ha="center", va="center",
+                     color="white" if cm[i, j] > cm.max() / 2. else "black")
+    plt.ylabel('Actual Label')
+    plt.xlabel('Predicted Label')
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, f"{ticker}_residual_analysis.png"), dpi=300, bbox_inches='tight')
     plt.close()
@@ -334,18 +324,18 @@ def main():
     plt.figure(figsize=(14, 8))
     ax_top = plt.subplot(2, 1, 1)
     ax_top.plot(eval_prices, label=f'{ticker} Close Price', color='black', lw=1.2)
-    long_mask = ensemble_preds > 0.0
+    long_mask = ensemble_preds >= optimal_thresh
     cash_mask = ~long_mask
-    ax_top.scatter(np.where(long_mask)[0], eval_prices[long_mask], marker='^', color='green', s=25, alpha=0.7, label='Signal: Long (Pred > 0)')
-    ax_top.scatter(np.where(cash_mask)[0], eval_prices[cash_mask], marker='v', color='red', s=25, alpha=0.7, label='Signal: Cash (Pred <= 0)')
+    ax_top.scatter(np.where(long_mask)[0], eval_prices[long_mask], marker='^', color='green', s=25, alpha=0.7, label=f'Signal: Long (P >= {optimal_thresh:.2f})')
+    ax_top.scatter(np.where(cash_mask)[0], eval_prices[cash_mask], marker='v', color='red', s=25, alpha=0.7, label=f'Signal: Cash (P < {optimal_thresh:.2f})')
     ax_top.set_title(f'Cross-Asset Signals: BTC-Trained Model on {ticker} Price')
     ax_top.set_ylabel('Price (USD)')
     ax_top.legend(loc='upper left')
     ax_top.grid(True, alpha=0.3)
 
     ax_bot = plt.subplot(2, 1, 2, sharex=ax_top)
-    ax_bot.plot(backtest_res['strategy_curve'] * 100.0, label=f'BTC-Trained Strategy on {ticker} ({backtest_res["total_strategy_return"]:.1f}%)', color='forestgreen', lw=1.8)
-    ax_bot.plot(backtest_res['market_curve'] * 100.0, label=f'{ticker} Buy & Hold Benchmark ({backtest_res["total_market_return"]:.1f}%)', color='gray', linestyle='--', lw=1.4)
+    ax_bot.plot(backtest_res['cumulative_strategy'] * 100.0, label=f'BTC-Trained Strategy on {ticker} ({backtest_res["total_strategy_return"]:.1f}%)', color='forestgreen', lw=1.8)
+    ax_bot.plot(backtest_res['cumulative_market'] * 100.0, label=f'{ticker} Buy & Hold Benchmark ({backtest_res["total_market_return"]:.1f}%)', color='gray', linestyle='--', lw=1.4)
     ax_bot.set_title('Cumulative Return Backtest (%)')
     ax_bot.set_xlabel('Evaluation Days')
     ax_bot.set_ylabel('Cumulative Return (%)')

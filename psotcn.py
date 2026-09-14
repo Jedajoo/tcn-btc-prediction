@@ -17,7 +17,7 @@ except Exception:
 
 # Global Constants & Hyperparameter Constraints
 ticker = "BTC-USD"
-FIXED_TIME_WINDOW = 60
+FIXED_TIME_WINDOW = 90
 FIXED_KERNEL_SIZE = 2
 FIXED_BATCH_SIZE = 32
 DEFAULT_DILATIONS = [1, 2, 4, 8, 16, 32]
@@ -27,9 +27,9 @@ DEFAULT_DILATIONS = [1, 2, 4, 8, 16, 32]
 RECEPTIVE_FIELD = 1 + 2 * (FIXED_KERNEL_SIZE - 1) * 1 * sum(DEFAULT_DILATIONS)
 
 print(f"--- Hybrid TCN-GRU & GWO-WOA Configuration ---")
-print(f"  Target         : Next-Day Log Return (Continuous Regression)")
+print(f"  Target         : Next-Day Direction (Binary Classification: Up/Down)")
 print(f"  Kernel Size    : {FIXED_KERNEL_SIZE}")
-print(f"  Time Window    : {FIXED_TIME_WINDOW} days (2 Months)")
+print(f"  Time Window    : {FIXED_TIME_WINDOW} days (3 Months)")
 print(f"  Batch Size     : {FIXED_BATCH_SIZE}")
 print(f"  Dilations      : {DEFAULT_DILATIONS}")
 print(f"  Receptive Field: {RECEPTIVE_FIELD}")
@@ -176,8 +176,7 @@ def load_tabular_data():
 
 def precache_sequence_data(train_features, train_target):
     import utils as ut
-    train_mean_drift = float(np.mean(train_target))
-    X_all, y_all = ut.create_sequences(train_features, train_target - train_mean_drift, FIXED_TIME_WINDOW)
+    X_all, y_all = ut.create_sequences(train_features, train_target, FIXED_TIME_WINDOW)
     val_size = max(1, int(len(X_all) * 0.20))
     return {
         FIXED_TIME_WINDOW: {
@@ -231,9 +230,10 @@ def objective_function(params, precomputed_data, n_features):
         verbose=1
     )
 
-    best_val_rmse = float(min(history.history.get('val_rmse', [999.0])))
     best_val_loss = float(min(history.history.get('val_loss', [999.0])))
-    fitness = best_val_rmse
+    best_val_acc = float(max(history.history.get('val_accuracy', [0.0])))
+    best_val_auc = float(max(history.history.get('val_auc', [0.0])))
+    fitness = best_val_loss
 
     # Strict memory cleanup
     del model
@@ -246,7 +246,7 @@ def objective_function(params, precomputed_data, n_features):
         f"Window={hp['time_window']} (RF={hp['receptive_field']}), "
         f"Drop={hp['dropout']:.3f}, LR={hp['learning_rate']:.5f}, "
         f"Batch={hp['batch_size']}, WD={hp['weight_decay']:.5f} | "
-        f"ValRMSE={best_val_rmse:.5f}, ValLoss={best_val_loss:.5f} | Fitness={fitness:.5f}"
+        f"ValLoss={best_val_loss:.5f}, ValAcc={best_val_acc*100:.2f}%, ValAUC={best_val_auc:.4f} | Fitness={fitness:.5f}"
     )
 
     return fitness
@@ -263,7 +263,7 @@ def run_gwo_woa_worker():
     init_gpu()
     train_tab, test_tab = load_tabular_data()
     train_features = train_tab["features"]
-    train_target = train_tab["returns"]  # Next-day log return continuous target
+    train_target = train_tab["target"]  # Next-day directional binary target (0 or 1)
     n_features = train_features.shape[1]
 
     precomputed_data = precache_sequence_data(train_features, train_target)
@@ -328,17 +328,17 @@ def run_gwo_woa_worker():
             beta_pos = alpha_pos.copy() if alpha_pos is not None else None
             alpha_score = fitness
             alpha_pos = agent['position'].copy()
-            print(f"  >>> New Alpha Leader Fitness (RMSE): {alpha_score:.5f}")
+            print(f"  >>> New Alpha Leader Fitness (ValLoss): {alpha_score:.5f}")
         elif fitness < beta_score:
             delta_score = beta_score
             delta_pos = beta_pos.copy() if beta_pos is not None else None
             beta_score = fitness
             beta_pos = agent['position'].copy()
-            print(f"  >>> New Beta Leader Fitness (RMSE): {beta_score:.5f}")
+            print(f"  >>> New Beta Leader Fitness (ValLoss): {beta_score:.5f}")
         elif fitness < delta_score:
             delta_score = fitness
             delta_pos = agent['position'].copy()
-            print(f"  >>> New Delta Leader Fitness (RMSE): {delta_score:.5f}")
+            print(f"  >>> New Delta Leader Fitness (ValLoss): {delta_score:.5f}")
 
         # Fallback initialization if leaders are not yet populated
         if beta_pos is None:
@@ -442,10 +442,10 @@ def run_final_ensemble():
     init_gpu()
     train_tab, test_tab = load_tabular_data()
     train_features = train_tab["features"]
-    train_target = train_tab["returns"]  # Next-day continuous log return
+    train_target = train_tab["target"]  # Next-day directional binary target (0 or 1)
     train_prices = train_tab["prices"]
     test_features = test_tab["features"]
-    test_target = test_tab["returns"]
+    test_target = test_tab["target"]
     test_prices = test_tab["prices"]
     n_features = train_features.shape[1]
 
@@ -469,11 +469,8 @@ def run_final_ensemble():
     )
 
     best_window = best_hp["time_window"]
-    train_mean_drift = float(np.mean(train_target))
-    print(f"Historical Train Mean Daily Return (Drift): {train_mean_drift:.6f} ({train_mean_drift*100:.3f}%/day)")
-    train_target_demeaned = train_target - train_mean_drift
 
-    X_train_final, y_train_final = ut.create_sequences(train_features, train_target_demeaned, best_window)
+    X_train_final, y_train_final = ut.create_sequences(train_features, train_target, best_window)
     val_size = max(1, int(len(X_train_final) * 0.20))
     X_tr_final, y_tr_final = X_train_final[:-val_size], y_train_final[:-val_size]
     X_val_final, y_val_final = X_train_final[-val_size:], y_train_final[-val_size:]
@@ -541,27 +538,27 @@ def run_final_ensemble():
             with open(seed_history_path, "wb") as f:
                 pickle.dump(history, f)
 
-        # Predict on validation and test sets (adding back drift to evaluate real returns)
-        val_pred = model.predict(X_val_final, verbose=0).ravel() + train_mean_drift
+        # Predict on validation and test sets (probabilities in [0, 1])
+        val_pred = model.predict(X_val_final, verbose=0).ravel()
         val_individual_predictions.append(val_pred)
 
-        pred = model.predict(X_test_final, verbose=0).ravel() + train_mean_drift
+        pred = model.predict(X_test_final, verbose=0).ravel()
         individual_predictions.append(pred)
 
-        seed_metrics = ut.compute_regression_metrics(y_test_final, pred)
-        print(f"Seed {seed}: RMSE={seed_metrics['rmse']:.5f}, MAE={seed_metrics['mae']:.5f}, R2={seed_metrics['r2']:.4f}, DA={seed_metrics['directional_accuracy']:.2f}%")
+        seed_metrics = ut.compute_classification_metrics(y_test_final, pred, threshold=0.50)
+        print(f"Seed {seed}: Acc={seed_metrics['accuracy']*100:.2f}%, AUC={seed_metrics['auc']:.4f}, F1={seed_metrics['f1']:.4f}, Loss={seed_metrics['log_loss']:.5f}")
 
         seed_histories.append(history)
-        min_val_rmse = min(history.get('val_rmse', [999.0]))
-        seed_val_rmses.append(min_val_rmse)
+        min_val_loss = min(history.get('val_loss', [999.0]))
+        seed_val_rmses.append(min_val_loss)
 
-        plt.plot(history.get('val_loss', []), label=f"Seed {seed} Val Loss (min RMSE={min_val_rmse:.5f})")
+        plt.plot(history.get('val_loss', []), label=f"Seed {seed} Val Loss (min={min_val_loss:.5f})")
 
         del model
         tf.keras.backend.clear_session()
         gc.collect()
 
-    plt.title("Hybrid TCN-GRU Multi-Seed Validation Huber Loss")
+    plt.title("Hybrid TCN-GRU Multi-Seed Validation Binary Crossentropy Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Validation Loss")
     plt.legend()
@@ -572,71 +569,87 @@ def run_final_ensemble():
     # 6. Ensemble Evaluation
     print("\n--- Generating Multi-Seed Ensemble Predictions ---")
     ensemble_predictions = np.mean(individual_predictions, axis=0)
-    ensemble_metrics = ut.compute_regression_metrics(y_test_final, ensemble_predictions)
+    val_ensemble_probs = np.mean(val_individual_predictions, axis=0)
+    optimal_thresh = ut.find_optimal_threshold(y_val_final, val_ensemble_probs)
+    print(f"Calibrated Optimal Threshold (Youden's J): {optimal_thresh:.4f}")
+    best_hp["optimal_threshold"] = optimal_thresh
 
-    test_eval_returns = test_target[-len(y_test_final):]
+    ensemble_metrics = ut.compute_classification_metrics(y_test_final, ensemble_predictions, threshold=optimal_thresh)
+
+    test_eval_returns = test_tab["returns"][-len(y_test_final):]
     test_eval_prices = test_prices[-len(y_test_final):]
-    backtest_res = ut.backtest_return_strategy(test_eval_returns, ensemble_predictions, threshold=0.0)
+    backtest_res = ut.backtest_directional_strategy(test_eval_returns, ensemble_predictions, threshold=optimal_thresh)
 
     print("\n==========================================")
-    print("FINAL HYBRID TCN-GRU ENSEMBLE REGRESSION PERFORMANCE")
+    print("FINAL HYBRID TCN-GRU ENSEMBLE DIRECTIONAL PERFORMANCE")
     print("==========================================")
-    print(f"Ensemble RMSE (Log Return) : {ensemble_metrics['rmse']:.6f}")
-    print(f"Ensemble MAE  (Log Return) : {ensemble_metrics['mae']:.6f}")
-    print(f"Ensemble MSE               : {ensemble_metrics['mse']:.8f}")
-    print(f"Ensemble R2 Score          : {ensemble_metrics['r2']:.4f}")
-    print(f"Directional Accuracy (DA)  : {ensemble_metrics['directional_accuracy']:.2f}%")
-    print(f"Pearson Correlation (r)    : {ensemble_metrics['pearson_corr']:.4f}")
+    print(f"Calibrated Threshold       : {optimal_thresh:.4f}")
+    print(f"Directional Accuracy (DA)  : {ensemble_metrics['accuracy']*100:.2f}%")
+    print(f"ROC-AUC Score              : {ensemble_metrics['auc']:.4f}")
+    print(f"Precision (Up Class)       : {ensemble_metrics['precision']:.4f}")
+    print(f"Recall (Up Class)          : {ensemble_metrics['recall']:.4f}")
+    print(f"F1 Score                   : {ensemble_metrics['f1']:.4f}")
+    print(f"Brier Score Loss           : {ensemble_metrics['brier_score']:.5f}")
+    print(f"Log Loss (BCE)             : {ensemble_metrics['log_loss']:.5f}")
+    print(f"High Confidence Accuracy   : {ensemble_metrics['high_conf_acc']*100:.2f}% (Coverage: {ensemble_metrics['high_conf_coverage']:.1f}%)")
     print(f"Strategy Cumulative Return : {backtest_res['total_strategy_return']:.2f}% (vs Market Buy&Hold: {backtest_res['total_market_return']:.2f}%)")
     print(f"Strategy Sharpe Ratio      : {backtest_res['sharpe_ratio']:.2f}")
-    print(f"Strategy Max Drawdown      : {backtest_res['max_drawdown']:.2f}%")
+    print(f"Confusion Matrix: \n{ensemble_metrics['confusion_matrix']}")
     print("==========================================\n")
 
     evaluation_summary = {
         "ensemble_metrics": ensemble_metrics,
         "backtest_results": backtest_res,
         "best_hyperparameters": best_hp,
-        "seed_val_rmses": seed_val_rmses,
-        "train_mean_drift": train_mean_drift
+        "seed_val_losses": seed_val_rmses,
+        "optimal_threshold": optimal_thresh
     }
     dump(evaluation_summary, "output/model/ensemble_evaluation.joblib")
     dump(best_hp, "output/model/best_hyperparameters.joblib")
 
-    # 7. Generate Regression & Financial Plots
-    # A. Actual vs Predicted Log Returns
+    # 7. Generate Classification & Financial Plots
+    # A. Actual Direction vs Predicted Up Probability
     plt.figure(figsize=(14, 6))
-    plt.plot(y_test_final, label='Actual Next-Day Log Return', color='black', alpha=0.6, lw=1.2)
-    plt.plot(ensemble_predictions, label=f'Hybrid TCN-GRU Predicted (RMSE={ensemble_metrics["rmse"]:.4f})', color='royalblue', lw=1.5)
-    plt.axhline(0, color='gray', linestyle='--', alpha=0.5)
-    plt.title(f'{ticker} Next-Day Log Return: Actual vs Hybrid TCN-GRU Ensemble Prediction')
+    plt.scatter(range(len(y_test_final)), y_test_final, label='Actual Direction (1=Up, 0=Down)', color='black', alpha=0.3, s=15)
+    plt.plot(ensemble_predictions, label=f'Hybrid TCN-GRU P(Up) (AUC={ensemble_metrics["auc"]:.4f})', color='royalblue', lw=1.5)
+    plt.axhline(optimal_thresh, color='red', linestyle='--', alpha=0.7, label=f'Calibrated Threshold ({optimal_thresh:.3f})')
+    plt.title(f'{ticker} Next-Day Direction: Actual vs Hybrid TCN-GRU Ensemble Probability')
     plt.xlabel('Test Sample Days')
-    plt.ylabel('Log Return')
+    plt.ylabel('P(Up)')
     plt.legend(loc='upper left')
     plt.grid(True, alpha=0.3)
     plt.savefig('output/plots/actual_vs_predicted_returns.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    # B. Residual Analysis & Scatter
-    residuals = y_test_final - ensemble_predictions
+    # B. Probability Distribution & Confusion Matrix
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     
-    ax1.scatter(y_test_final, ensemble_predictions, alpha=0.5, color='teal', s=20)
-    min_v = min(np.min(y_test_final), np.min(ensemble_predictions))
-    max_v = max(np.max(y_test_final), np.max(ensemble_predictions))
-    ax1.plot([min_v, max_v], [min_v, max_v], color='red', linestyle='--', label='Identity (Ideal)')
-    ax1.set_title('Actual vs Predicted Scatter Plot')
-    ax1.set_xlabel('Actual Log Return')
-    ax1.set_ylabel('Predicted Log Return')
+    ax1.hist(ensemble_predictions[y_test_final == 1], bins=25, alpha=0.6, color='forestgreen', label='Actual Up (1)')
+    ax1.hist(ensemble_predictions[y_test_final == 0], bins=25, alpha=0.6, color='crimson', label='Actual Down (0)')
+    ax1.axvline(optimal_thresh, color='blue', linestyle='--', label=f'Threshold ({optimal_thresh:.3f})')
+    ax1.set_title('Predicted Probability Distribution by Class')
+    ax1.set_xlabel('Predicted Probability P(Up)')
+    ax1.set_ylabel('Count')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
-    ax2.hist(residuals, bins=30, color='mediumpurple', edgecolor='black', alpha=0.7)
-    ax2.axvline(0, color='red', linestyle='--', label=f'Mean Error ({np.mean(residuals):.5f})')
-    ax2.set_title('Prediction Residuals Distribution')
-    ax2.set_xlabel('Residual (Actual - Predicted)')
-    ax2.set_ylabel('Frequency')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    cm = ensemble_metrics['confusion_matrix']
+    im = ax2.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    ax2.set_title('Directional Confusion Matrix')
+    plt.colorbar(im, ax=ax2)
+    classes = ['Down (0)', 'Up (1)']
+    tick_marks = np.arange(len(classes))
+    ax2.set_xticks(tick_marks)
+    ax2.set_xticklabels(classes)
+    ax2.set_yticks(tick_marks)
+    ax2.set_yticklabels(classes)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax2.text(j, i, format(cm[i, j], 'd'),
+                     ha="center", va="center",
+                     color="white" if cm[i, j] > cm.max() / 2. else "black")
+    ax2.set_ylabel('Actual Label')
+    ax2.set_xlabel('Predicted Label')
     plt.tight_layout()
     plt.savefig('output/plots/residual_analysis.png', dpi=300, bbox_inches='tight')
     plt.close()
@@ -645,11 +658,12 @@ def run_final_ensemble():
     plt.figure(figsize=(14, 7))
     ax_top = plt.subplot(2, 1, 1)
     ax_top.plot(test_eval_prices, label=f'{ticker} Actual Close Price', color='black', alpha=0.8)
-    long_signals = np.where(ensemble_predictions > 0)[0]
-    cash_signals = np.where(ensemble_predictions <= 0)[0]
-    ax_top.scatter(long_signals, test_eval_prices[long_signals], color='green', marker='^', s=25, label='Signal Long (Pred Return > 0)', alpha=0.7)
-    ax_top.scatter(cash_signals, test_eval_prices[cash_signals], color='red', marker='v', s=25, label='Signal Cash (Pred Return <= 0)', alpha=0.7)
-    ax_top.set_title(f'Hybrid TCN-GRU Predicted Signals vs {ticker} Price')
+    pred_binary = (ensemble_predictions >= optimal_thresh).astype(int)
+    long_signals = np.where(pred_binary == 1)[0]
+    cash_signals = np.where(pred_binary == 0)[0]
+    ax_top.scatter(long_signals, test_eval_prices[long_signals], color='green', marker='^', s=25, label=f'Signal Long (P >= {optimal_thresh:.2f})', alpha=0.7)
+    ax_top.scatter(cash_signals, test_eval_prices[cash_signals], color='red', marker='v', s=25, label=f'Signal Cash (P < {optimal_thresh:.2f})', alpha=0.7)
+    ax_top.set_title(f'Hybrid TCN-GRU Predicted Direction Signals vs {ticker} Price')
     ax_top.legend(loc='upper left')
     ax_top.grid(True, alpha=0.3)
 
@@ -673,7 +687,7 @@ def run_orchestrator(script_path):
     print("==========================================================")
     print(" HYBRID GWO-WOA ORCHESTRATOR: Process Isolation Enabled")
     print(f" Target: {n_iterations} Iterations, {n_agents} Agents")
-    print(" Model : Hybrid TCN-GRU (Next-Day Log Return Regression)")
+    print(" Model : Hybrid TCN-GRU (Next-Day Directional Classification)")
     print(" Process is terminated after each iteration to free 100% RAM.")
     print("==========================================================")
 
