@@ -7,295 +7,274 @@ from sklearn.feature_selection import mutual_info_regression, mutual_info_classi
 import matplotlib.pyplot as plt
 from joblib import dump
 
-# Ensure output directories exist
 os.makedirs('output/data/plots', exist_ok=True)
 os.makedirs('output/scaler', exist_ok=True)
-os.makedirs('output/plots', exist_ok=True)
-os.makedirs('output/model', exist_ok=True)
-os.makedirs('checkpoints/seeds', exist_ok=True)
 
-ticker1 = 'BTC-USD'
-ticker2 = 'ETH-USD'
+ticker = 'BTC-USD'
 start_date = '2020-01-01'
-end_date = '2026-01-01'
-time_window = 90  # Default sequence window (90 days)
+end_date = '2026-09-01'
+time_window = 120
 
-def download_data(ticker, start_date, end_date, time_window):
-    print(f"Downloading historical data for {ticker} from {start_date} to {end_date}...")
-    df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=False)
+df = pd.DataFrame(yf.download(ticker, start=start_date, end=end_date, auto_adjust=False))
 
-    # Flatten MultiIndex columns if present
-    if isinstance(df.columns, pd.MultiIndex):
-        if ticker in df.columns.levels[1]:
-            df = df.xs(ticker, axis=1, level='Ticker')
-        else:
-            df.columns = df.columns.get_level_values(-1)
+if isinstance(df.columns, pd.MultiIndex):
+    if ticker in df.columns.levels[1]:
+        df = df.xs(ticker, axis=1, level='Ticker')
+    else:
+        df.columns = df.columns.get_level_values(-1)
 
-    # Drop redundant 'Close' if 'Adj Close' is present
-    if 'Close' in df.columns and 'Adj Close' in df.columns:
-        df = df.drop(columns=['Close'])
-    elif 'Close' in df.columns and 'Adj Close' not in df.columns:
-        df['Adj Close'] = df['Close']
-        df = df.drop(columns=['Close'])
+if 'Close' in df.columns and 'Adj Close' in df.columns:
+    df = df.drop(columns=['Close'])
+elif 'Close' in df.columns and 'Adj Close' not in df.columns:
+    df['Adj Close'] = df['Close']
+    df = df.drop(columns=['Close'])
 
-    # Filter invalid volume rows
-    df_filtered = df[df['Volume'] > 0].dropna()
-    print(f"Data count after filtering volume and missing values: {len(df_filtered)}")
-    df = df_filtered.copy()
+df_filtered = df[df['Volume'] > 0]
+print(f"Data count after filtering volume and missing values: {len(df_filtered)}")
+df = df_filtered.copy()
 
-    # ==========================================
-    # 1. TECHNICAL INDICATORS & STATIONARY FEATURE ENGINEERING
-    # ==========================================
-    close_s = df['Adj Close'].squeeze()
-    high_s = df['High'].squeeze()
-    low_s = df['Low'].squeeze()
-    open_s = df['Open'].squeeze()
-    vol_s = df['Volume'].squeeze()
+close_s = df['Adj Close'].squeeze()
+high_s = df['High'].squeeze()
+low_s = df['Low'].squeeze()
+open_s = df['Open'].squeeze()
+vol_s = df['Volume'].squeeze()
 
-    # A. Stationary Price & Return Ratios
-    df['Log_Return_1'] = np.log(close_s / (close_s.shift(1) + 1e-9)).fillna(0.0)
-    df['Log_Return_3'] = np.log(close_s / (close_s.shift(3) + 1e-9)).fillna(0.0)
-    df['Log_Return_5'] = np.log(close_s / (close_s.shift(5) + 1e-9)).fillna(0.0)
-    df['Log_Return_10'] = np.log(close_s / (close_s.shift(10) + 1e-9)).fillna(0.0)
+df['Log_Return_1'] = np.log(close_s / (close_s.shift(1) + 1e-9)).fillna(0.0)
+df['Log_Return_3'] = np.log(close_s / (close_s.shift(3) + 1e-9)).fillna(0.0)
+df['Log_Return_5'] = np.log(close_s / (close_s.shift(5) + 1e-9)).fillna(0.0)
+df['Log_Return_10'] = np.log(close_s / (close_s.shift(10) + 1e-9)).fillna(0.0)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [1, 1]})
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [1, 1]})
 
-    ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.25)
-    ax1.set_title('Close Price')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.25)
+ax1.set_title('Close Price')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
 
-    ax2.plot(df.index, df['Log_Return_1'], label='Log Return 1', color='blue')
-    ax2.plot(df.index, df['Log_Return_3'], label='Log Return 3', color='red')
-    ax2.plot(df.index, df['Log_Return_5'], label='Log Return 5', color='green')
-    ax2.plot(df.index, df['Log_Return_10'], label='Log Return 10', color='yellow')
-    ax2.set_title('Log Return')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+ax2.plot(df.index, df['Log_Return_1'], label='Log Return 1', color='blue')
+ax2.plot(df.index, df['Log_Return_3'], label='Log Return 3', color='red')
+ax2.plot(df.index, df['Log_Return_5'], label='Log Return 5', color='green')
+ax2.plot(df.index, df['Log_Return_10'], label='Log Return 10', color='yellow')
+ax2.set_title('Log Return')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
 
-    plt.savefig(f"output/data/plots/log_return_{ticker}.png", dpi=300, bbox_inches='tight')
-    plt.close()
+plt.savefig(f"output/data/plots/log_return.png", dpi=300, bbox_inches='tight')
+plt.close()
 
+df['High_Low_Ratio'] = ((high_s - low_s) / (close_s + 1e-9)).fillna(0.0)
+df['Close_Open_Ratio'] = ((close_s - open_s) / (open_s + 1e-9)).fillna(0.0)
 
-    df['High_Low_Ratio'] = ((high_s - low_s) / (close_s + 1e-9)).fillna(0.0)
-    df['Close_Open_Ratio'] = ((close_s - open_s) / (open_s + 1e-9)).fillna(0.0)
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [1, 1]})
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [1, 1]})
+ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.25)
+ax1.set_title('Close Price')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
 
-    ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.25)
-    ax1.set_title('Close Price')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+ax2.plot(df.index, df['High_Low_Ratio'], label='High Low Ratio', color='blue')
+ax2.plot(df.index, df['Close_Open_Ratio'], label='Close Open Ratio', color='red')
+ax2.set_title('Price Ratio')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
 
-    ax2.plot(df.index, df['High_Low_Ratio'], label='High Low Ratio', color='blue')
-    ax2.plot(df.index, df['Close_Open_Ratio'], label='Close Open Ratio', color='red')
-    ax2.set_title('Price Ratio')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+plt.savefig(f"output/data/plots/price_ratio_{ticker}.png", dpi=300, bbox_inches='tight')
+plt.close()
 
-    plt.savefig(f"output/data/plots/price_ratio_{ticker}.png", dpi=300, bbox_inches='tight')
-    plt.close()
+df['SMA10'] = close_s.rolling(10, min_periods=1).mean()
+df['SMA25'] = close_s.rolling(25, min_periods=1).mean()
+df['SMA50'] = close_s.rolling(50, min_periods=1).mean()
 
-    # B. Moving Averages Ratios (Distance from SMA)
-    df['SMA10'] = close_s.rolling(10, min_periods=1).mean()
-    df['SMA25'] = close_s.rolling(25, min_periods=1).mean()
-    df['SMA50'] = close_s.rolling(50, min_periods=1).mean()
+df['Dist_SMA10'] = ((close_s - df['SMA10']) / (df['SMA10'] + 1e-9)).fillna(0.0)
+df['Dist_SMA25'] = ((close_s - df['SMA25']) / (df['SMA25'] + 1e-9)).fillna(0.0)
+df['Dist_SMA50'] = ((close_s - df['SMA50']) / (df['SMA50'] + 1e-9)).fillna(0.0)
 
-    df['Dist_SMA10'] = ((close_s - df['SMA10']) / (df['SMA10'] + 1e-9)).fillna(0.0)
-    df['Dist_SMA25'] = ((close_s - df['SMA25']) / (df['SMA25'] + 1e-9)).fillna(0.0)
-    df['Dist_SMA50'] = ((close_s - df['SMA50']) / (df['SMA50'] + 1e-9)).fillna(0.0)
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), sharex=True, gridspec_kw={'height_ratios': [1, 1]})
+ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.25)
+ax1.plot(df.index, df['SMA10'], label='SMA 10', color='blue')
+ax1.plot(df.index, df['SMA25'], label='SMA 25', color='red')
+ax1.plot(df.index, df['SMA50'], label='SMA 50', color='green')
+ax1.set_title('Simple Moving Average')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), sharex=True, gridspec_kw={'height_ratios': [1, 1]})
-    ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.25)
-    ax1.plot(df.index, df['SMA10'], label='SMA 10', color='blue')
-    ax1.plot(df.index, df['SMA25'], label='SMA 25', color='red')
-    ax1.plot(df.index, df['SMA50'], label='SMA 50', color='green')
-    ax1.set_title('Simple Moving Average')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+ax2.plot(df.index, df['Dist_SMA10'], label='SMA 10', color='blue')
+ax2.plot(df.index, df['Dist_SMA25'], label='SMA 25', color='red')
+ax2.plot(df.index, df['Dist_SMA50'], label='SMA 50', color='green')
+ax2.set_title('Distance From Close to SMA')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+plt.savefig(f"output/data/plots/moving_averages_{ticker}.png", dpi=300, bbox_inches='tight')
+plt.close()
 
-    ax2.plot(df.index, df['Dist_SMA10'], label='SMA 10', color='blue')
-    ax2.plot(df.index, df['Dist_SMA25'], label='SMA 25', color='red')
-    ax2.plot(df.index, df['Dist_SMA50'], label='SMA 50', color='green')
-    ax2.set_title('Distance From Close to SMA')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    plt.savefig(f"output/data/plots/moving_averages_{ticker}.png", dpi=300, bbox_inches='tight')
-    plt.close()
+ema_12 = close_s.ewm(span=12, min_periods=1).mean()
+ema_26 = close_s.ewm(span=26, min_periods=1).mean()
+macd_line = ema_12 - ema_26
+macd_signal = macd_line.ewm(span=9, min_periods=1).mean()
+macd_hist = macd_line - macd_signal
+df['MACD_Line_Norm'] = (macd_line / (close_s + 1e-9)).fillna(0.0)
+df['MACD_Signal_Norm'] = (macd_signal / (close_s + 1e-9)).fillna(0.0)
+df['MACD_Hist_Norm'] = (macd_hist / (close_s + 1e-9)).fillna(0.0)
 
 
-    # C. Normalized MACD
-    ema_12 = close_s.ewm(span=12, min_periods=1).mean()
-    ema_26 = close_s.ewm(span=26, min_periods=1).mean()
-    macd_line = ema_12 - ema_26
-    macd_signal = macd_line.ewm(span=9, min_periods=1).mean()
-    macd_hist = macd_line - macd_signal
-    df['MACD_Line_Norm'] = (macd_line / (close_s + 1e-9)).fillna(0.0)
-    df['MACD_Signal_Norm'] = (macd_signal / (close_s + 1e-9)).fillna(0.0)
-    df['MACD_Hist_Norm'] = (macd_hist / (close_s + 1e-9)).fillna(0.0)
+plt.figure(figsize=(24, 12))
+plt.plot(df.index, df['MACD_Line_Norm'], label='MACD Line', color='blue')
+plt.plot(df.index, df['MACD_Signal_Norm'], label='MACD Signal', color='red')
+plt.axhline(0, color='black', linewidth=1, linestyle='-')
+plt.title('MACD Indicator')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.savefig(f"output/data/plots/macd_indicator{ticker}.png", dpi=300, bbox_inches='tight')
+plt.close()
+
+# D. RSI (14) Normalized to [-1.0, 1.0]
+delta = close_s.diff()
+gain = delta.where(delta > 0, 0.0)
+loss = -delta.where(delta < 0, 0.0)
+avg_gain = gain.ewm(alpha=1/14, min_periods=1).mean()
+avg_loss = loss.ewm(alpha=1/14, min_periods=1).mean()
+rs = avg_gain / (avg_loss + 1e-9)
+rsi = 100.0 - (100.0 / (1.0 + rs))
+rsi = rsi.replace([np.inf, -np.inf], np.nan).ffill().bfill()
+df['RSI_Norm'] = (rsi - 50.0) / 50.0
+
+plt.figure(figsize=(24, 12))
+plt.plot(df.index, df['RSI_Norm'], label='Normalized RSI', color='blue')
+plt.title('RSI')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.savefig(f"output/data/plots/rsi_{ticker}.png", dpi=300, bbox_inches='tight')
+plt.close()
+
+# E. Bollinger Bands Normalized
+std_dev = close_s.rolling(20, min_periods=1).std(ddof=0).fillna(0)
+m_band = close_s.rolling(20, min_periods=1).mean()
+upper_bband = m_band + 2 * std_dev
+lower_bband = m_band - 2 * std_dev
+band_width = upper_bband - lower_bband
+df['Band_Pos'] = ((close_s - lower_bband) / (band_width + 1e-9)).clip(-1.0, 2.0).fillna(0.5)
+df['Band_Width_Norm'] = (band_width / (close_s + 1e-9)).fillna(0.0)
+
+plt.figure(figsize=(24, 12))
+plt.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.25)
+plt.plot(df.index, upper_bband, label='Upper BBand', color='blue')
+plt.plot(df.index, lower_bband, label='Lower BBand', color='red')
+plt.fill_between(df.index, upper_bband, lower_bband, color='purple', alpha=0.25)
+plt.title('Bollinger Bands')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.savefig(f"output/data/plots/bollinger_band_{ticker}.png", dpi=300, bbox_inches='tight')
+plt.close()
+
+# F. Garman-Klass Volatility
+log_hl = np.log(np.maximum(high_s / (low_s + 1e-9), 1e-9))
+log_co = np.log(np.maximum(close_s / (open_s + 1e-9), 1e-9))
+gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
+df['GK_Vol'] = np.sqrt(np.maximum(gk_var, 0.0))
+df['GK_Vol_14'] = df['GK_Vol'].rolling(14, min_periods=1).mean()
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
+
+ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.6)
+ax1.set_title('Close Price')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+ax2.plot(df.index, df['GK_Vol'], label='Garman-Klass 1', color='blue')
+ax2.plot(df.index, df['GK_Vol_14'], label='Garman-Klass 14', color='red')
+ax2.axhline(0, color='black', linewidth=1, linestyle='-')
+ax2.set_title('Chaikin Money Flow')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+plt.savefig(f"output/data/plots/garman_klass_{ticker}.png", dpi=300, bbox_inches='tight')
+plt.close()
+
+# G. Chaikin Money Flow (CMF 20)
+hl_diff = (high_s - low_s).replace(0, np.nan)
+mf_multiplier = ((close_s - low_s) - (high_s - close_s)) / (hl_diff + 1e-9)
+mf_multiplier = mf_multiplier.fillna(0.0)
+mf_volume = mf_multiplier * vol_s
+df['CMF'] = mf_volume.rolling(20, min_periods=1).sum() / (vol_s.rolling(20, min_periods=1).sum() + 1e-9)
+df['CMF'] = df['CMF'].replace([np.inf, -np.inf], np.nan).ffill().bfill()
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
+
+ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.6)
+ax1.set_title('Close Price')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+ax2.plot(df.index, df['CMF'], label='CMF', color='green')
+ax2.axhline(0, color='black', linewidth=1, linestyle='-')
+ax2.set_title('Chaikin Money Flow')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+plt.savefig(f"output/data/plots/chaikin_money_flow_{ticker}.png", dpi=300, bbox_inches='tight')
+plt.close()
+
+# H. Stochastic Oscillator Normalized to [-1.0, 1.0]
+lowest_low_14 = low_s.rolling(14, min_periods=1).min()
+highest_high_14 = high_s.rolling(14, min_periods=1).max()
+stoch_range = (highest_high_14 - lowest_low_14).replace(0, np.nan)
+stoch_k = ((close_s - lowest_low_14) / (stoch_range + 1e-9)) * 100.0
+stoch_k = stoch_k.replace([np.inf, -np.inf], np.nan).ffill().bfill()
+stoch_d = stoch_k.rolling(3, min_periods=1).mean().ffill().bfill()
+df['Stoch_K_Norm'] = (stoch_k - 50.0) / 50.0
+df['Stoch_D_Norm'] = (stoch_d - 50.0) / 50.0
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
+
+ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.6)
+ax1.set_title('Close Price')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+ax2.plot(df.index, df['Stoch_K_Norm'], label='Stoch K', color='blue')
+ax2.plot(df.index, df['Stoch_D_Norm'], label='Stoch D', color='red')
+ax2.axhline(0, color='black', linewidth=1, linestyle='-')
+ax2.set_title('Stochastic Oscillator')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+plt.savefig(f"output/data/plots/stochastic_oscillator_{ticker}.png", dpi=300, bbox_inches='tight')
+plt.close()
 
 
-    plt.figure(figsize=(24, 12))
-    plt.plot(df.index, df['MACD_Line_Norm'], label='MACD Line', color='blue')
-    plt.plot(df.index, df['MACD_Signal_Norm'], label='MACD Signal', color='red')
-    plt.axhline(0, color='black', linewidth=1, linestyle='-')
-    plt.title('MACD Indicator')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(f"output/data/plots/macd_indicator{ticker}.png", dpi=300, bbox_inches='tight')
-    plt.close()
+# I. Volume Relative Metrics
+vol_sma20 = vol_s.rolling(20, min_periods=1).mean()
+df['Volume_Pct_Change'] = (vol_s.pct_change()).clip(-2.0, 5.0).fillna(0.0)
+df['Volume_SMA_Ratio'] = ((vol_s / (vol_sma20 + 1e-9)) - 1.0).clip(-2.0, 5.0).fillna(0.0)
 
-    # D. RSI (14) Normalized to [-1.0, 1.0]
-    delta = close_s.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.ewm(alpha=1/14, min_periods=1).mean()
-    avg_loss = loss.ewm(alpha=1/14, min_periods=1).mean()
-    rs = avg_gain / (avg_loss + 1e-9)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    rsi = rsi.replace([np.inf, -np.inf], np.nan).ffill().bfill()
-    df['RSI_Norm'] = (rsi - 50.0) / 50.0
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
 
-    plt.figure(figsize=(24, 12))
-    plt.plot(df.index, df['RSI_Norm'], label='Normalized RSI', color='blue')
-    plt.title('RSI')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(f"output/data/plots/rsi_{ticker}.png", dpi=300, bbox_inches='tight')
-    plt.close()
+ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.6)
+ax1.set_title('Close Price')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
 
-    # E. Bollinger Bands Normalized
-    std_dev = close_s.rolling(20, min_periods=1).std(ddof=0).fillna(0)
-    m_band = close_s.rolling(20, min_periods=1).mean()
-    upper_bband = m_band + 2 * std_dev
-    lower_bband = m_band - 2 * std_dev
-    band_width = upper_bband - lower_bband
-    df['Band_Pos'] = ((close_s - lower_bband) / (band_width + 1e-9)).clip(-1.0, 2.0).fillna(0.5)
-    df['Band_Width_Norm'] = (band_width / (close_s + 1e-9)).fillna(0.0)
+ax2.bar(df.index, df['Volume_Pct_Change'], label='RVOL', color='blue')
+ax2.plot(df.index, df['Volume_SMA_Ratio'], label='RVOL SMA 20', color='red', alpha=0.25)
+ax2.axhline(0, color='black', linewidth=1, linestyle='-')
+ax2.set_title('RVOL')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
 
-    plt.figure(figsize=(24, 12))
-    plt.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.25)
-    plt.plot(df.index, upper_bband, label='Upper BBand', color='blue')
-    plt.plot(df.index, lower_bband, label='Lower BBand', color='red')
-    plt.fill_between(df.index, upper_bband, lower_bband, color='purple', alpha=0.25)
-    plt.title('Bollinger Bands')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(f"output/data/plots/bollinger_band_{ticker}.png", dpi=300, bbox_inches='tight')
-    plt.close()
+plt.savefig(f"output/data/plots/RVOL_{ticker}.png", dpi=300, bbox_inches='tight')
+plt.close()
 
-    # F. Garman-Klass Volatility
-    log_hl = np.log(np.maximum(high_s / (low_s + 1e-9), 1e-9))
-    log_co = np.log(np.maximum(close_s / (open_s + 1e-9), 1e-9))
-    gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
-    df['GK_Vol'] = np.sqrt(np.maximum(gk_var, 0.0))
-    df['GK_Vol_14'] = df['GK_Vol'].rolling(14, min_periods=1).mean()
+df['Next_Adj_Close'] = close_s.shift(-1)
+df['Next_Log_Return'] = np.log(df['Next_Adj_Close'] / close_s)
+df.dropna(subset=['Next_Adj_Close']).copy()
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
+df = df.dropna()
 
-    ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.6)
-    ax1.set_title('Close Price')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+print(f"\nDataset shape after indicator calculations: {df.shape}")
 
-    ax2.plot(df.index, df['GK_Vol'], label='Garman-Klass 1', color='blue')
-    ax2.plot(df.index, df['GK_Vol_14'], label='Garman-Klass 14', color='red')
-    ax2.axhline(0, color='black', linewidth=1, linestyle='-')
-    ax2.set_title('Chaikin Money Flow')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+# Save full processed tabular dataset
+df.to_csv(f"output/data/dataset_{ticker}.csv", index=True)
 
-    plt.savefig(f"output/data/plots/garman_klass_{ticker}.png", dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # G. Chaikin Money Flow (CMF 20)
-    hl_diff = (high_s - low_s).replace(0, np.nan)
-    mf_multiplier = ((close_s - low_s) - (high_s - close_s)) / (hl_diff + 1e-9)
-    mf_multiplier = mf_multiplier.fillna(0.0)
-    mf_volume = mf_multiplier * vol_s
-    df['CMF'] = mf_volume.rolling(20, min_periods=1).sum() / (vol_s.rolling(20, min_periods=1).sum() + 1e-9)
-    df['CMF'] = df['CMF'].replace([np.inf, -np.inf], np.nan).ffill().bfill()
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
-
-    ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.6)
-    ax1.set_title('Close Price')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    ax2.plot(df.index, df['CMF'], label='CMF', color='green')
-    ax2.axhline(0, color='black', linewidth=1, linestyle='-')
-    ax2.set_title('Chaikin Money Flow')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.savefig(f"output/data/plots/chaikin_money_flow_{ticker}.png", dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # H. Stochastic Oscillator Normalized to [-1.0, 1.0]
-    lowest_low_14 = low_s.rolling(14, min_periods=1).min()
-    highest_high_14 = high_s.rolling(14, min_periods=1).max()
-    stoch_range = (highest_high_14 - lowest_low_14).replace(0, np.nan)
-    stoch_k = ((close_s - lowest_low_14) / (stoch_range + 1e-9)) * 100.0
-    stoch_k = stoch_k.replace([np.inf, -np.inf], np.nan).ffill().bfill()
-    stoch_d = stoch_k.rolling(3, min_periods=1).mean().ffill().bfill()
-    df['Stoch_K_Norm'] = (stoch_k - 50.0) / 50.0
-    df['Stoch_D_Norm'] = (stoch_d - 50.0) / 50.0
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
-
-    ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.6)
-    ax1.set_title('Close Price')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    ax2.plot(df.index, df['Stoch_K_Norm'], label='Stoch K', color='blue')
-    ax2.plot(df.index, df['Stoch_D_Norm'], label='Stoch D', color='red')
-    ax2.axhline(0, color='black', linewidth=1, linestyle='-')
-    ax2.set_title('Stochastic Oscillator')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.savefig(f"output/data/plots/stochastic_oscillator_{ticker}.png", dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-    # I. Volume Relative Metrics
-    vol_sma20 = vol_s.rolling(20, min_periods=1).mean()
-    df['Volume_Pct_Change'] = (vol_s.pct_change()).clip(-2.0, 5.0).fillna(0.0)
-    df['Volume_SMA_Ratio'] = ((vol_s / (vol_sma20 + 1e-9)) - 1.0).clip(-2.0, 5.0).fillna(0.0)
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
-
-    ax1.plot(df.index, df['Adj Close'], label='Adj Close', color='black', alpha=0.6)
-    ax1.set_title('Close Price')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    ax2.bar(df.index, df['Volume_Pct_Change'], label='RVOL', color='blue')
-    ax2.plot(df.index, df['Volume_SMA_Ratio'], label='RVOL SMA 20', color='red', alpha=0.25)
-    ax2.axhline(0, color='black', linewidth=1, linestyle='-')
-    ax2.set_title('RVOL')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.savefig(f"output/data/plots/RVOL_{ticker}.png", dpi=300, bbox_inches='tight')
-    plt.close()
-
-    df['Next_Adj_Close'] = close_s.shift(-1)
-    df['Next_Log_Return'] = np.log(df['Next_Adj_Close'] / close_s + 1e-9).fillna(0.0)
-    df['Target_Direction'] = (df['Next_Adj_Close'] > close_s).astype(int)
-
-    df = df.dropna()
-
-    print(f"\nDataset shape after indicator calculations: {df.shape}")
-
-    # Save full processed tabular dataset
-    df.to_csv(f"output/data/dataset_{ticker}.csv", index=True)
-
-    return df
-
-# Feature columns list (STRICTLY STATIONARY & SCALE-INVARIANT INDICATORS)
 feature_cols = [
     'Log_Return_1', 'Log_Return_3', 'Log_Return_5', 'Log_Return_10',
     'High_Low_Ratio', 'Close_Open_Ratio',
@@ -306,11 +285,6 @@ feature_cols = [
     'Volume_Pct_Change', 'Volume_SMA_Ratio',
 ]
 
-print(f"Number of feature columns: {len(feature_cols)}")
-
-# ==========================================
-# 2. mRMR FEATURE SELECTION ALGORITHM
-# ==========================================
 def mrmr_feature_selection(
     X: np.ndarray,
     y: np.ndarray,
@@ -414,30 +388,20 @@ def mrmr_feature_selection(
     selected_features = [feature_names[i] for i in selected_indices]
     return selected_indices, selected_features, selection_history
 
+split_percentage = 0.80
+split_index = int(len(df) * split_percentage)
 
-# ==========================================
-# 3. TRAIN / TEST SPLIT & ROBUST SCALING
-# ==========================================
+train_df = df.iloc[:split_index]
+test_df = df.iloc[split_index:]
 
-train_df = download_data(ticker1, start_date, end_date, time_window)
-test_df = download_data(ticker2, start_date, end_date, time_window)
-
-print(f"Training set: {len(train_df)} rows ({train_df.index[0].date()} to {train_df.index[-1].date()})")
-print(f"Testing set : {len(test_df)} rows ({test_df.index[0].date()} to {test_df.index[-1].date()})")
-
-# Fit RobustScaler ONLY on training feature set
 scaler = RobustScaler(quantile_range=(25.0, 75.0))
-train_features_scaled = scaler.fit_transform(train_df[feature_cols])
-test_features_scaled = scaler.fit_transform(test_df[feature_cols])
+train_scaled = scaler.fit_transform(train_df[feature_cols])
+test_scaled = scaler.transform(test_df[feature_cols])
 
-# ==========================================
-# 4. mRMR FEATURE SELECTION (AFTER SCALING)
-# ==========================================
-n_features_to_select = 15
-print(f"\n--- Running mRMR Feature Selection (Selecting Top {n_features_to_select} of {len(feature_cols)} features for Directional Target) ---")
+n_features_to_select = 10
 selected_indices, selected_features, selection_history = mrmr_feature_selection(
-    X=train_features_scaled,
-    y=train_df['Target_Direction'].values,
+    X=train_scaled,
+    y=train_df['Adj Close'].values,
     feature_names=feature_cols,
     n_features_to_select=n_features_to_select,
     method="MID",
@@ -450,16 +414,13 @@ print("-" * 72)
 for h in selection_history:
     print(f"{h['step']:<5} | {h['feature']:<20} | {h['relevance']:<15.4f} | {h['redundancy']:<12.4f} | {h['score']:<12.4f}")
 
-# Filter scaled feature matrices to only include selected features
-train_features_scaled = train_features_scaled[:, selected_indices]
-test_features_scaled = test_features_scaled[:, selected_indices]
+train_scaled = train_scaled[:, selected_indices]
+test_scaled = test_scaled[:, selected_indices]
 
-# Save RobustScaler fitted on selected features & selected feature column names
-final_scaler = RobustScaler(quantile_range=(25.0, 75.0))
-final_scaler.fit(train_df[selected_features])
-dump(final_scaler, "output/scaler/feature_scaler.joblib")
+dump(scaler, "output/scaler/feature_scaler.joblib")
 dump(selected_features, "output/scaler/feature_columns.joblib")
 print(f"\nSaved RobustScaler & selected feature names ({len(selected_features)} features) to output/scaler/")
+
 
 # Plot and save mRMR Feature Ranking
 plt.figure(figsize=(12, 6))
@@ -474,36 +435,21 @@ plt.savefig('output/data/plots/mrmr_feature_selection.png', dpi=300, bbox_inches
 plt.close()
 print("Saved mRMR selection plot to output/data/plots/mrmr_feature_selection.png")
 
-# ==========================================
-# 5. DEFAULT SEQUENCE GENERATION (WINDOW=90)
-# ==========================================
-def create_sequences_from_arrays(features, target, window):
+def create_sequences_from_arrays(data, window):
     X, y = [], []
-    for i in range(len(features) - window + 1):
-        X.append(features[i : (i + window)])
-        y.append(target[i + window - 1])
+    for i in range(len(data) - window):
+        X.append(data[i : (i + window)])
+        # Target: Harga 'Adj Close' (kolom pertama) pada hari berikutnya
+        y.append(data[i + window, 0])
     return np.array(X), np.array(y)
 
-# For training sequences (Directional Target: 0 or 1)
 X_train, y_train = create_sequences_from_arrays(
-    train_features_scaled,
-    train_df['Target_Direction'].values,
+    train_scaled,
     time_window
 )
 
-# For testing sequences (concatenate train buffer to avoid losing initial test samples)
-test_input_features = np.vstack([
-    train_features_scaled[-time_window+1:],
-    test_features_scaled
-])
-test_input_target = np.concatenate([
-    train_df['Target_Direction'].values[-time_window+1:],
-    test_df['Target_Direction'].values
-])
-
 X_test, y_test = create_sequences_from_arrays(
-    test_input_features,
-    test_input_target,
+    test_scaled,
     time_window
 )
 
@@ -511,14 +457,9 @@ print(f"\nDefault Sequence Shapes (window={time_window}):")
 print(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
 print(f"X_test : {X_test.shape}, y_test : {y_test.shape}")
 
-np.savez("output/data/train_data.npz", X=X_train, y=y_train)
-np.savez("output/data/test_data.npz", X=X_test, y=y_test)
-
-# Save tabular arrays for downstream optimization / PSO compatibility
 np.savez(
     "output/data/train_tabular.npz",
-    features=train_features_scaled,
-    target=train_df['Target_Direction'].values,
+    features=train_scaled,
     prices=train_df['Adj Close'].values,
     next_prices=train_df['Next_Adj_Close'].values,
     returns=train_df['Next_Log_Return'].values,
@@ -526,12 +467,12 @@ np.savez(
 )
 np.savez(
     "output/data/test_tabular.npz",
-    features=test_features_scaled,
-    target=test_df['Target_Direction'].values,
+    features=test_scaled,
     prices=test_df['Adj Close'].values,
     next_prices=test_df['Next_Adj_Close'].values,
     returns=test_df['Next_Log_Return'].values,
     dates=test_df.index.astype(str).values
 )
 
-print("Data preprocessing and mRMR feature selection completed successfully.")
+np.savez("output/data/train_data.npz", X=X_train, y=y_train)
+np.savez("output/data/test_data.npz", X=X_test, y=y_test)
