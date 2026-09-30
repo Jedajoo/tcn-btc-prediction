@@ -14,16 +14,42 @@ from sklearn.metrics import (
 )
 
 
-def build_tcn_model(input_shape, n_filters, k_size, dropout, learning_rate):
-    # Helper untuk membangun model berdasarkan parameter dari PSO
+def create_sequences(features, target, window):
+    """
+    Creates (samples, window, features) and corresponding 1-step-ahead target.
+    """
+    features = np.asarray(features)
+    target = np.asarray(target)
+    
+    X, y = [], []
+    for i in range(len(features) - window):
+        X.append(features[i : (i + window)])
+        y.append(target[i + window])
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+
+def build_tcn_model(
+    input_shape,
+    n_filters,
+    k_size=2,
+    dropout=0.1,
+    learning_rate=1e-3,
+    weight_decay=1e-4,
+    dilations=None,
+    **kwargs
+):
+    # Helper untuk membangun model berdasarkan parameter dari GWO-WOA / PSO
+    if dilations is None:
+        dilations = [1, 2, 4, 8, 16]
+
     tcn_layer = TCN(
         nb_filters=int(n_filters),
         kernel_size=int(k_size),
         nb_stacks=1,
-        dilations=[1, 2, 4, 8, 16],
+        dilations=dilations,
         padding='causal',
         use_skip_connections=True,
-        dropout_rate=dropout,
+        dropout_rate=float(dropout),
         return_sequences=False,
         input_shape=input_shape
     )
@@ -34,14 +60,28 @@ def build_tcn_model(input_shape, n_filters, k_size, dropout, learning_rate):
     outputs = layers.Dense(1, activation='linear')(x)
 
     model = Model(inputs=[inputs], outputs=[outputs])
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate), loss=tf.keras.losses.MeanSquaredError(name='MSE'))
+    try:
+        optimizer = tf.keras.optimizers.AdamW(
+            learning_rate=float(learning_rate),
+            weight_decay=float(weight_decay)
+        )
+    except Exception:
+        optimizer = tf.keras.optimizers.Adam(learning_rate=float(learning_rate))
+
+    model.compile(
+        optimizer=optimizer,
+        loss=tf.keras.losses.MeanSquaredError(name='MSE'),
+        metrics=['mse']
+    )
     return model
 
-def get_early_stopping(patience=20):
+def get_early_stopping(patience=20, monitor='val_los', mode='min', verbose=0):
     return EarlyStopping(
-        monitor='val_loss',  # Monitor validation loss
-        patience=patience,         # Number of epochs with no improvement after which training will be stopped
-        restore_best_weights=True # Restore model weights from the epoch with the best value of the monitored quantity.
+        monitor=monitor,
+        patience=patience,
+        mode=mode,
+        verbose=verbose,
+        restore_best_weights=True
     )
 
 def get_reduce_lr(monitor='val_loss', factor=0.5, patience=10, min_lr=1e-6, mode='min', verbose=0):
@@ -56,6 +96,44 @@ def get_reduce_lr(monitor='val_loss', factor=0.5, patience=10, min_lr=1e-6, mode
         mode=mode,
         verbose=verbose
     )
+
+def inverse_transform_target(data, scaler_or_path="output/scaler/target_scaler.joblib"):
+    """
+    Inverse transforms scaled target or prediction values back to their original scale (e.g. BTC-USD price).
+
+    Parameters:
+    -----------
+    data : array-like
+        Scaled target or prediction values. Supports 1D array (N,) or 2D array (N, 1) or (M, N).
+    scaler_or_path : str or sklearn Scaler object
+        Path to the saved scaler joblib file or an already loaded scaler instance.
+
+    Returns:
+    --------
+    np.ndarray
+        Inverse-transformed values in the original unscaled unit.
+    """
+    from joblib import load
+    if isinstance(scaler_or_path, str):
+        scaler = load(scaler_or_path)
+    else:
+        scaler = scaler_or_path
+
+    arr = np.asarray(data)
+    if arr.ndim == 1:
+        return scaler.inverse_transform(arr.reshape(-1, 1)).ravel()
+    elif arr.ndim == 2:
+        if arr.shape[1] == 1:
+            return scaler.inverse_transform(arr).ravel()
+        else:
+            return np.array([scaler.inverse_transform(row.reshape(-1, 1)).ravel() for row in arr])
+    else:
+        orig_shape = arr.shape
+        flat = arr.reshape(-1, 1)
+        inv = scaler.inverse_transform(flat)
+        return inv.reshape(orig_shape)
+
+inverse_transform = inverse_transform_target
 
 def compute_classification_metrics(y_true, y_prob, threshold=0.5):
     """
@@ -139,3 +217,38 @@ def backtest_directional_strategy(actual_returns, y_prob, threshold=0.5, fee=0.0
         "sharpe_ratio": sharpe,
         "signals": signals
     }
+
+def compute_directional_accuracy(y_true, y_pred, mode='mda'):
+    """
+    Computes Directional Accuracy (DA) in percentage (0 - 100%).
+
+    Parameters:
+    -----------
+    y_true : array-like
+        Actual target prices (USD).
+    y_pred : array-like
+        Predicted target prices (USD).
+    mode : str, 'mda' or 'trend'
+        - 'mda': Mean Directional Accuracy relative to previous known actual close:
+                 Sign(y_true[t] - y_true[t-1]) == Sign(y_pred[t] - y_true[t-1])
+        - 'trend': Predicted trajectory slope vs actual slope:
+                   Sign(y_true[t] - y_true[t-1]) == Sign(y_pred[t] - y_pred[t-1])
+
+    Returns:
+    --------
+    float: Percentage of correct direction predictions.
+    """
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
+    if len(y_true) < 2:
+        return 0.0
+
+    actual_diff = y_true[1:] - y_true[:-1]
+    if mode.lower() == 'trend':
+        pred_diff = y_pred[1:] - y_pred[:-1]
+    else:  # default 'mda'
+        pred_diff = y_pred[1:] - y_true[:-1]
+
+    # Matching sign indicates correct direction
+    correct = (np.sign(actual_diff) == np.sign(pred_diff))
+    return float(np.mean(correct) * 100.0)

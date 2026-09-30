@@ -276,6 +276,7 @@ print(f"\nDataset shape after indicator calculations: {df.shape}")
 df.to_csv(f"output/data/dataset_{ticker}.csv", index=True)
 
 feature_cols = [
+    'Adj Close',
     'Log_Return_1', 'Log_Return_3', 'Log_Return_5', 'Log_Return_10',
     'High_Low_Ratio', 'Close_Open_Ratio',
     'Dist_SMA10', 'Dist_SMA25', 'Dist_SMA50',
@@ -394,13 +395,18 @@ split_index = int(len(df) * split_percentage)
 train_df = df.iloc[:split_index]
 test_df = df.iloc[split_index:]
 
-scaler = RobustScaler(quantile_range=(25.0, 75.0))
-train_scaled = scaler.fit_transform(train_df[feature_cols])
-test_scaled = scaler.transform(test_df[feature_cols])
+# Scaler sementara hanya untuk menghitung ranking mRMR pada seluruh kandidat.
+selection_scaler = RobustScaler(quantile_range=(25.0, 75.0))
+train_all_scaled = selection_scaler.fit_transform(train_df[feature_cols])
+
+# Target scaler eksplisit untuk harga 'Adj Close'
+target_scaler = RobustScaler(quantile_range=(25.0, 75.0))
+train_target_scaled = target_scaler.fit_transform(train_df[['Adj Close']]).ravel()
+test_target_scaled = target_scaler.transform(test_df[['Adj Close']]).ravel()
 
 n_features_to_select = 10
 selected_indices, selected_features, selection_history = mrmr_feature_selection(
-    X=train_scaled,
+    X=train_all_scaled,
     y=train_df['Adj Close'].values,
     feature_names=feature_cols,
     n_features_to_select=n_features_to_select,
@@ -414,12 +420,15 @@ print("-" * 72)
 for h in selection_history:
     print(f"{h['step']:<5} | {h['feature']:<20} | {h['relevance']:<15.4f} | {h['redundancy']:<12.4f} | {h['score']:<12.4f}")
 
-train_scaled = train_scaled[:, selected_indices]
-test_scaled = test_scaled[:, selected_indices]
+# Scaler produksi menerima tepat fitur yang disimpan di feature_columns.joblib.
+scaler = RobustScaler(quantile_range=(25.0, 75.0))
+train_scaled = scaler.fit_transform(train_df[selected_features])
+test_scaled = scaler.transform(test_df[selected_features])
 
 dump(scaler, "output/scaler/feature_scaler.joblib")
+dump(target_scaler, "output/scaler/target_scaler.joblib")
 dump(selected_features, "output/scaler/feature_columns.joblib")
-print(f"\nSaved RobustScaler & selected feature names ({len(selected_features)} features) to output/scaler/")
+print(f"\nSaved RobustScaler (features & target) & selected feature names ({len(selected_features)} features) to output/scaler/")
 
 
 # Plot and save mRMR Feature Ranking
@@ -435,27 +444,32 @@ plt.savefig('output/data/plots/mrmr_feature_selection.png', dpi=300, bbox_inches
 plt.close()
 print("Saved mRMR selection plot to output/data/plots/mrmr_feature_selection.png")
 
-def create_sequences_from_arrays(data, window):
-    X, y = [], []
-    for i in range(len(data) - window):
-        X.append(data[i : (i + window)])
-        # Target: Harga 'Adj Close' (kolom pertama) pada hari berikutnya
-        y.append(data[i + window, 0])
-    return np.array(X), np.array(y)
+def create_sequences_from_arrays(features, target, target_raw, window):
+    X, y, y_raw = [], [], []
+    for i in range(len(features) - window):
+        X.append(features[i : (i + window)])
+        # Target: Harga 'Adj Close' pada hari berikutnya (t + 1)
+        y.append(target[i + window])
+        y_raw.append(target_raw[i + window])
+    return np.array(X), np.array(y), np.array(y_raw)
 
-X_train, y_train = create_sequences_from_arrays(
+X_train, y_train, y_train_raw = create_sequences_from_arrays(
     train_scaled,
+    train_target_scaled,
+    train_df['Adj Close'].values,
     time_window
 )
 
-X_test, y_test = create_sequences_from_arrays(
+X_test, y_test, y_test_raw = create_sequences_from_arrays(
     test_scaled,
+    test_target_scaled,
+    test_df['Adj Close'].values,
     time_window
 )
 
 print(f"\nDefault Sequence Shapes (window={time_window}):")
-print(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
-print(f"X_test : {X_test.shape}, y_test : {y_test.shape}")
+print(f"X_train: {X_train.shape}, y_train: {y_train.shape} (selected features: {len(selected_features)})")
+print(f"X_test : {X_test.shape}, y_test : {y_test.shape} (selected features: {len(selected_features)})")
 
 np.savez(
     "output/data/train_tabular.npz",
@@ -463,6 +477,7 @@ np.savez(
     prices=train_df['Adj Close'].values,
     next_prices=train_df['Next_Adj_Close'].values,
     returns=train_df['Next_Log_Return'].values,
+    target=train_target_scaled,
     dates=train_df.index.astype(str).values
 )
 np.savez(
@@ -471,8 +486,10 @@ np.savez(
     prices=test_df['Adj Close'].values,
     next_prices=test_df['Next_Adj_Close'].values,
     returns=test_df['Next_Log_Return'].values,
+    target=test_target_scaled,
     dates=test_df.index.astype(str).values
 )
 
-np.savez("output/data/train_data.npz", X=X_train, y=y_train)
-np.savez("output/data/test_data.npz", X=X_test, y=y_test)
+np.savez("output/data/train_data.npz", X=X_train, y=y_train, y_raw=y_train_raw)
+np.savez("output/data/test_data.npz", X=X_test, y=y_test, y_raw=y_test_raw)
+print("Successfully generated and saved sequence datasets to output/data/")
